@@ -160,6 +160,8 @@ DSH 回合内已经会做自检，桥也会独立跑 `verifyCommands`。大多�
 
 **默认不要开 reviewer**。以下情况不需要：`auto` 任务、纯机械改动、验收标准完全由测试覆盖、Astra 自己能快速看 diff 确认。只有需求语义/范围有歧义、或者 DSH 自检和测试都无法证明“做的是对的东西”时再用。
 
+如果当前主对话已经使用 `gpt-6.1-sol`，不要再 spawn 一个同模型 reviewer；直接由 Astra 做需求确认，避免重复调用。
+
 reviewer 的输入：
 
 - 原始需求 / 验收标准（task packet 的 `goal`、`context`、`acceptance`）
