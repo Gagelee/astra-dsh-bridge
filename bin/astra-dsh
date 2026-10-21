@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin launcher for the DSH-side shared-board CLI.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec node "$here/../src/cli.mjs" "$@"

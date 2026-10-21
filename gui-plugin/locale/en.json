@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Astra-DSH Workspace Attach",
+    "description": "Attaches DSH ACP execution sessions to their project workspaces automatically."
+  }
+}

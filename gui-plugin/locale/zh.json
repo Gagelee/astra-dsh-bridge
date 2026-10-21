@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Astra-DSH 工作区自动归组",
+    "description": "把 DSH ACP 执行会话自动挂到对应项目的工作区分组下。"
+  }
+}

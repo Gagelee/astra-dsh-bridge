@@ -1,0 +1,19 @@
+{
+  "name": "astra-dsh-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Astra (Codex) \u2194 DSH execution bridge: shared workspace task board, MCP tools for Codex, ACP-driven DSH sessions.",
+  "bin": {
+    "astra-dsh": "./bin/astra-dsh"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:integration": "node --test test/*.test.mjs",
+    "doctor": "node src/cli.mjs doctor"
+  },
+  "license": "MIT"
+}

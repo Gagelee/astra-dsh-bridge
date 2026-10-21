@@ -1,0 +1,5 @@
+# Attach bridge-created ACP sessions to the DSH workspace that owns their cwd.
+- insert:
+    - id: astra-dsh-workspace-attach
+      name: '@astra-dsh/workspace-attach'
+      config: {}
