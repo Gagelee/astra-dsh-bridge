@@ -29,7 +29,7 @@ GUI 自动归组插件 `@astra-dsh/workspace-attach` 已从 `gui-plugin/` 安装
 
 > 把这个需求交给 DSH 执行：……
 
-Astra 会调用 `dsh_dispatch`，随后用 `dsh_wait` / `dsh_result` 审阅，再决定 `dsh_review` 或继续 `dsh_message`。
+Astra 会调用 `dsh_dispatch`；任务完成后桥会在**同一个 Codex thread** 里触发一轮 Astra，Astra 再用 `dsh_result` 审阅并 `dsh_review`。
 
 从 DSH 侧发起需求：
 
@@ -70,12 +70,14 @@ EOF
 
 ### 1. 任务包（Astra → DSH）
 
-`dsh_dispatch` 的字段构成任务包，至少包含 `goal` 与一条 `acceptance`：
+`dsh_dispatch` 的字段构成任务包，至少包含 `goal`、`implementationPlan` 与一条 `acceptance`：
 
 | 字段 | 作用 |
 |---|---|
 | `title` | 任务标题 |
-| `goal` | 要达成的结果 |
+| `taskKind` | `implement`（默认，要求 `writeScopes`）/ `verify` |
+| `goal` | 要实现的结果 |
+| `implementationPlan` | Astra 的分析结论和实施计划；DSH 按此动手，可补充实现级分析，但不能另做产品规划 |
 | `context` | 背景、历史决策、项目理解、用户约束 |
 | `files` | 相关文件与说明 |
 | `constraints` | 硬性限制 |
@@ -89,12 +91,13 @@ EOF
 | `verifyCommands` | 桥在每回合后独立执行的验收命令（最多 5 条，每条 120s） |
 | `model` / `reasoningEffort` | 本次任务使用的 DSH 模型与推理档位 |
 
-任务包原样落盘为 `task.md`，并注入 DSH 的第一条 prompt。DSH 不需要继承 Astra 的内部推理，但能拿到执行所需的完整事实。
+任务包原样落盘为 `task.md`，并注入 DSH 的第一条 prompt。**Astra 负责分析、方向、优先级和计划；DSH 负责按计划修改。** DSH 可以在实现中进一步分析代码和边界，但交付物是改动和验证结果，不是产品分析/路线图。
 
 ### 2. 回合与持久会话
 
 - 一个任务对应一个 DSH ACP 会话，跨回合、跨桥重启持久化。
-- `dsh_wait` 阻塞到当前回合结束；`dsh_status` 随时看进度；`dsh_result` 读完整报告。
+- 任务 settle 后，桥用 `codex queue --thread <当前 Codex thread>` 触发一轮 Astra；不轮询、不新建 session。
+- `dsh_status` 随时看进度；`dsh_result` 读完整报告；`dsh_wait` 只作为诊断/兜底。
 - `dsh_message` 在 DSH 运行时进入队列，当前回合结束后自动开始下一回合；`mode=interrupt` 会先取消当前回合。
 - `dsh_cancel` 停止当前回合并清空队列，会话日志保留，可继续。
 
@@ -153,13 +156,19 @@ EOF
 
 如果任务一开始判断为 `light`，执行中发现命中风险清单（改动越界、测试失败、DSH 提问、跨模块），再升级到 `full`。
 
-### 4.2 等待与额度
+### 4.2 触发式完成（不再轮询）
 
-- `dsh_wait` 是**阻塞的工具调用**。等待本身不产生模型 token；但每次超时返回都会开启一轮新的 Astra 思考，反复 wait/status 才会烧额度。
-- 预计 5 分钟内完成的任务：一次 `dsh_wait` 180–300 秒即可。
-- 预计更长的任务：`dsh_dispatch` 后先结束回合，告诉用户“DSH 在跑”；用户回来或隔一段时间再 `dsh_status` 一次。不要循环 wait。
-- 桥在回合结束后**主动**跑 `verifyCommands`，这是本地进程执行，不消耗模型额度；`auto` 模式还会直接签收，省掉一轮 Astra 验收。
-- DSH 不能主动唤醒 Codex。MCP 是拉取模型：DSH 写任务板，Astra 在下次工具调用时读取。需要“完成提醒”时，用 macOS 本地通知/终端提醒，而不是让 Astra 轮询。
+- `dsh_dispatch` 后 Astra 结束回合，不调用 `dsh_wait`。
+- 任务 settle 时，桥从当前 MCP 调用 `_meta.threadId` 取得同一 Codex thread，执行：
+
+```bash
+codex queue --thread <threadId> --message "DSH task T-... settled; call dsh_result and dsh_review."
+```
+
+- 这会开启**一轮新的 Astra**，但仍在原 thread / 原 session，不新建会话。
+- 多个任务同时 settle 会合并成一条消息；`auto` 已签收、`cancelled` 的任务不触发。
+- `dsh_wait` 保留为诊断/兜底；如果它正在等，桥会抑制完成通知，避免双唤醒。
+- 桥仍会在回合结束后本地执行 `verifyCommands`，不消耗模型 token。
 
 ### 4.3 需求确认 reviewer（可选，默认关闭）
 
@@ -211,9 +220,9 @@ Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
 1. 用户在 Codex 说“把这个需求交给 DSH”。
 2. Astra 读项目、拆任务，调用 `dsh_dispatch`（`reviewMode` 默认 `light`）。
 3. 桥写 `task.md`、加锁、打开/恢复 DSH 会话、把任务包作为 prompt 发出，立即返回 `taskId`。
-4. Astra 调 `dsh_wait` 阻塞等待；期间可 `dsh_status` 看工具调用与进度。
-5. 回合结束，Astra 调 `dsh_result`，再用 `dsh_diff` / `dsh_read_file`（或自己的 shell/测试）核对真实改动。
-6. 通过则 `dsh_review accepted`；不通过则 `changes_requested` + `dsh_message`/`continueTask` 返工，再回到第 4 步。
+4. Astra 结束回合；任务 settle 后，桥通过 `codex queue --thread <当前 thread>` 在同一会话触发一轮 Astra。
+5. Astra 调 `dsh_result`，再用 `dsh_diff` / `dsh_read_file`（或自己的 shell/测试）核对真实改动。
+6. 通过则 `dsh_review accepted`；不通过则 `changes_requested` + `dsh_message`/`continueTask` 发回 DSH 返工，**不要自己改 DSH 的交付文件**。
 7. 验收通过后 Astra 派发下一个依赖任务，最后向用户交付。
 
 用户只需要在开头表达一次需求；中间的派发、等待、追问、返工由 Astra 和 DSH 完成。
@@ -236,8 +245,9 @@ Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
 | `astra_inbox` | pickup：列出需求、待审阅任务、运行中任务 |
 | `astra_request_read` / `astra_request_create` / `astra_request_claim` | 需求的读取、创建、认领与规划 |
 | `astra_lock` | Astra 写锁的 acquire/release/status |
-| `dsh_dispatch` | 创建任务包并启动 DSH 回合 |
-| `dsh_list` / `dsh_status` / `dsh_wait` | 任务列表、进度、阻塞等待 |
+| `dsh_dispatch` | 创建实现任务包（Astra 计划）并启动 DSH 回合 |
+| `dsh_list` / `dsh_status` | 任务列表、进度 |
+| `dsh_wait` | 诊断/兜底等待（正常流程不用） |
 | `dsh_message` / `dsh_cancel` | 追加指令/回答问题/打断/停止 |
 | `dsh_result` / `dsh_diff` | 结果报告、真实工作区 diff |
 | `dsh_read_file` | 读取真实文件字节与 sha256，用于验收 |
@@ -258,7 +268,9 @@ Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
 | `ASTRA_DSH_EFFORT` | `high` | `off/low/high/max` |
 | `ASTRA_DSH_PERMISSION_MODE` | `workspace-write` | DSH 自身沙箱 |
 | `ASTRA_DSH_PERMISSION_POLICY` | `allow` | ACP 权限升级请求：`allow` 保持无人值守执行；`reject` 失败关闭 |
-| `ASTRA_DSH_WAIT_MAX_SEC` | `300` | `dsh_wait` 上限 |
+| `ASTRA_DSH_WAIT_MAX_SEC` | `300` | `dsh_wait` 诊断上限 |
+| `ASTRA_DSH_NOTIFY_CODEX` | `1` | 任务 settle 时是否用 `codex queue` 触发同一 thread；`0` 关闭 |
+| `ASTRA_DSH_CODEX_BIN` | 自动探测 Codex app CLI | `codex queue` 使用的 CLI 路径 |
 | `ASTRA_DSH_LOCK_TTL_MS` | 2h | DSH 回合锁租期 |
 | `ASTRA_DSH_VERIFY_TIMEOUT_MS` | `120000` | 每条 `verifyCommands` 的超时 |
 

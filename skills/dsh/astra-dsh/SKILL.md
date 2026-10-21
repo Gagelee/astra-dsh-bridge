@@ -79,6 +79,7 @@ astra-dsh diff   --workspace "$PWD" --since T-...
 
 - DSH 回合运行时不要编辑同一批文件；锁在 `astra-dsh status` 里可见。
 - 任务包在 `tasks/<T-id>/task.md`，结果在 `result.md`，真实改动在共享目录；向用户汇报时引用真实文件，不要只复述任务描述。
+- 任务包包含 Astra 的 `implementationPlan`。你的职责是按计划动手修改；可以在实现过程中进一步分析代码和边界条件、提出调整建议，但不要另做产品分析/优先级/路线图。计划有问题就用 `QUESTION:` 问 Astra。
 - 任务包可能包含 `Verification commands`：桥会在回合结束后独立执行这些命令。你仍应先自行验证，但不要修改或删除 `verification.json`，它由桥维护。
 - `accepted` 可能是 Astra 手动签收，也可能是 `auto` 模式在验证命令全部通过后自动签收；不要因此跳过自己回合内的验证。
 - Codex 发起的执行会话会写入共享 `~/.dsh/sessions`，GUI 插件会自动把它挂到对应项目 workspace（不存在时先创建）；GUI 只用于查看，执行中的控制仍由 Codex/Astra 完成。

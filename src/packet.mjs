@@ -31,6 +31,8 @@ export function renderTaskPacket({
   title,
   goal,
   context,
+  implementationPlan,
+  taskKind = 'implement',
   files,
   constraints,
   acceptance,
@@ -50,6 +52,7 @@ export function renderTaskPacket({
   return `# ${title}
 
 - **Task owner:** DSH (execution agent)
+- **Task type:** ${taskKind}
 - **Planner:** ${createdBy}
 - **Shared workspace:** \`${workspace}\`
 - **Parent request:** ${requestId ? `\`${requestId}\`` : '_none_'}
@@ -58,6 +61,14 @@ export function renderTaskPacket({
 ## Goal
 
 ${goal}
+
+## Astra's implementation plan (authoritative direction)
+
+${implementationPlan || '_Plan missing — do not start; ask Astra for the plan._'}
+
+DSH may inspect code and analyze implementation details further, and may propose
+adjustments. Do not replace this plan with a separate product analysis or
+roadmap; if the plan is wrong or incomplete, ask Astra.
 
 ## Context and decisions
 
@@ -112,7 +123,7 @@ branches unless this packet explicitly asks for it.
 export function renderExecutionPrompt({ task, packet, message }) {
   const header = `# DSH task ${task.id} — ${task.title}
 
-You are **DSH**, the execution agent in a two-agent workflow. **Astra** is the planner working in Codex. You share one local workspace with Astra, so every file you change is immediately reviewable by the planner.
+You are **DSH**, the execution agent in a two-agent workflow. **Astra** is the planner working in Codex. Astra owns the problem analysis, direction, priority, and the implementation plan in this packet. Your job is to implement that plan in the shared workspace. You may inspect code and analyze implementation details further, and you may propose adjustments; do not produce a separate product analysis or roadmap. If the plan is wrong or incomplete, ask Astra.
 
 ## Coordination rules
 

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { MOCK_CODEX, MOCK_CODEX_OUT } from './helpers.mjs'
 import { after, describe, it } from 'node:test'
 import { MOCK_ACP, makeWorkspace, startMcp } from './helpers.mjs'
 
@@ -15,6 +16,9 @@ function mockEnv(workspace) {
     ASTRA_DSH_MODEL: 'mock-model',
     ASTRA_DSH_EFFORT: 'low',
     ASTRA_DSH_PERMISSION_POLICY: 'allow',
+    ASTRA_DSH_CODEX_BIN: MOCK_CODEX,
+    ASTRA_DSH_NOTIFY_CODEX: '1',
+    MOCK_CODEX_OUT: MOCK_CODEX_OUT(workspace),
   }
 }
 
@@ -378,6 +382,87 @@ describe('Astra ↔ DSH bridge', () => {
       })
       assert.equal(dispatched.isError, true)
       assert.match(dispatched.text, /requires at least one verifyCommands/)
+    } finally {
+      await mcp.close()
+    }
+  })
+
+  it('requires Astra\'s implementation plan and write scopes for implementation tasks', async () => {
+    const { workspace, mcp } = await newBridge()
+    try {
+      const missingPlan = await mcp.request('tools/call', {
+        name: 'dsh_dispatch',
+        arguments: {
+          workspace,
+          title: 'No plan',
+          goal: 'Do something',
+          acceptance: ['something'],
+          writeScopes: ['dsh-output.txt'],
+        },
+      })
+      assert.equal(missingPlan.isError, true)
+      assert.match(missingPlan.content[0].text, /implementationPlan/)
+
+      const missingScope = await mcp.request('tools/call', {
+        name: 'dsh_dispatch',
+        arguments: {
+          workspace,
+          title: 'No scope',
+          goal: 'Do something',
+          implementationPlan: 'Change the output file.',
+          acceptance: ['something'],
+        },
+      })
+      assert.equal(missingScope.isError, true)
+      assert.match(missingScope.content[0].text, /writeScopes/)
+    } finally {
+      await mcp.close()
+    }
+  })
+
+  it('wakes the same Codex thread via codex queue when a task settles', async () => {
+    const { workspace, mcp } = await newBridge()
+    try {
+      const dispatched = await mcp.callWithMeta('dsh_dispatch', {
+        workspace,
+        title: 'Notify same thread',
+        goal: 'Create the mock output files.',
+        implementationPlan: 'Run the mock turn and create dsh-output.txt.',
+        acceptance: ['dsh-output.txt exists'],
+        writeScopes: ['dsh-output.txt', 'dsh-second-file.txt'],
+        verifyCommands: ['test -f dsh-output.txt'],
+        reviewMode: 'light',
+      }, { threadId: 'thread-e2e-1', sessionId: 'thread-e2e-1' })
+      assert.equal(dispatched.isError, false, dispatched.text)
+      await new Promise((resolve) => setTimeout(resolve, 2500))
+      const calls = readFileSync(MOCK_CODEX_OUT(workspace), 'utf8').trim().split('\n').filter(Boolean)
+      assert.ok(calls.length >= 1, 'codex queue was not invoked')
+      const args = JSON.parse(calls[0]).args
+      assert.deepEqual(args.slice(0, 3), ['queue', '--thread', 'thread-e2e-1'])
+      assert.match(args[3], /--message/)
+      assert.match(args[4], /T-/)
+      assert.match(args[4], /settled/)
+    } finally {
+      await mcp.close()
+    }
+  })
+
+  it('suppresses the completion trigger while dsh_wait is active', async () => {
+    const { workspace, mcp } = await newBridge()
+    try {
+      const dispatched = await mcp.callWithMeta('dsh_dispatch', {
+        workspace,
+        title: 'Wait suppression',
+        goal: 'Create the mock output files.',
+        implementationPlan: 'Run the mock turn and create dsh-output.txt.',
+        acceptance: ['dsh-output.txt exists'],
+        writeScopes: ['dsh-output.txt'],
+      }, { threadId: 'thread-wait-1', sessionId: 'thread-wait-1' })
+      assert.equal(dispatched.isError, false, dispatched.text)
+      const waited = await mcp.call('dsh_wait', { workspace, taskId: dispatched.structured.taskId, timeoutSec: 30 })
+      assert.equal(waited.structured.state, 'idle')
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+      assert.equal(existsSync(MOCK_CODEX_OUT(workspace)), false, 'completion trigger should be suppressed during dsh_wait')
     } finally {
       await mcp.close()
     }

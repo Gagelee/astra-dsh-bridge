@@ -40,6 +40,10 @@ async function handleRequest(message) {
   const { id, method, params } = message
   switch (method) {
     case 'initialize': {
+      bridge.codexInitialize = {
+        clientInfo: params?.clientInfo ?? null,
+        meta: params?._meta ?? null,
+      }
       const protocolVersion = typeof params?.protocolVersion === 'string' ? params.protocolVersion : '2025-06-18'
       sendResult(id, {
         protocolVersion,
@@ -59,6 +63,7 @@ async function handleRequest(message) {
     case 'tools/call': {
       const name = params?.name
       const args = params?.arguments ?? {}
+      bridge.codexCallMeta = params?._meta ?? null
       const controller = new AbortController()
       inflight.set(id, controller)
       try {

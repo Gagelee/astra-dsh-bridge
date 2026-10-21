@@ -123,13 +123,22 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'dsh_dispatch',
     description:
-      'Hand one fully specified task to DSH. Writes the durable task packet, opens a persistent DSH session, and starts execution in the shared workspace. Returns immediately with a task id; use dsh_wait or dsh_status afterwards. The packet must include goal and acceptance criteria so DSH does not need to re-ask for context. reviewMode defaults to light: Astra reviews the diff and targeted evidence rather than re-running everything. Use auto with verifyCommands for deterministic low-risk work, and full only for high-risk or ambiguous work.',
+      'Hand one fully specified implementation task to DSH. Astra must have already analysed the problem and written implementationPlan; DSH implements that plan (and may analyse implementation details further) but does not own product prioritisation or roadmap. The bridge starts execution and, when the task settles, wakes Astra in the same Codex thread via codex queue. Returns immediately; dsh_wait is only a diagnostic fallback. reviewMode defaults to light: Astra reviews the diff and targeted evidence rather than re-running everything. Use auto with verifyCommands for deterministic low-risk work, and full only for high-risk or ambiguous work.',
     inputSchema: {
       type: 'object',
       properties: {
         workspace: WORKSPACE,
         title: { type: 'string', description: 'Short task title.' },
-        goal: { type: 'string', description: 'One-paragraph definition of the outcome DSH must produce.' },
+        taskKind: {
+          type: 'string',
+          enum: ['implement', 'verify'],
+          description: 'implement (default) changes files and requires writeScopes; verify runs checks without changing files.',
+        },
+        goal: { type: 'string', description: 'One-paragraph definition of the implementation outcome DSH must produce.' },
+        implementationPlan: {
+          type: 'string',
+          description: 'Astra-owned implementation plan: files, concrete steps, boundaries. DSH follows this plan and may analyse implementation details further, but must not replace it with a separate product analysis or roadmap.',
+        },
         context: {
           type: 'string',
           description: 'Background, prior decisions, user constraints, and project understanding DSH needs. Write it as markdown.',
@@ -161,7 +170,7 @@ export const TOOL_DEFINITIONS = [
           type: 'string',
           enum: ['auto', 'light', 'full'],
           description:
-            'Acceptance tier. auto: bridge runs verifyCommands and auto-accepts only if every check passes, no questions, and changes stay inside writeScopes. light: bridge runs verification, Astra reviews diff/files but not a full acceptance pass. full: Astra performs the full acceptance review (default). auto requires verifyCommands.',
+            'Acceptance tier. auto: bridge runs verifyCommands and auto-accepts only if every check passes, no questions, and changes stay inside writeScopes. light: bridge runs verification, Astra reviews diff/files but not a full acceptance pass. full: Astra performs the full acceptance review. light is the default. auto requires verifyCommands.',
         },
         verifyCommands: {
           type: 'array',
@@ -171,7 +180,7 @@ export const TOOL_DEFINITIONS = [
             'Shell commands the bridge runs after each turn (max 5, 120s each) as independent evidence. They run in the workspace; they are not DSH self-reports. Example: ["npm test -- --runInBand"].',
         },
       },
-      required: ['workspace', 'title', 'goal', 'acceptance'],
+      required: ['workspace', 'title', 'goal', 'implementationPlan', 'acceptance'],
     },
   },
   {
@@ -208,7 +217,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'dsh_wait',
     description:
-      'Block until the current DSH turn settles (idle/failed/cancelled/interrupted) or the timeout expires, then return status plus final text. Prefer this over tight polling after dsh_dispatch.',
+      'Diagnostic fallback: block until the current DSH turn settles or the timeout expires. Normal flow uses the bridge completion trigger (codex queue) instead of dsh_wait. Do not poll with it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -485,7 +494,10 @@ function astraLock(bridge, input) {
 
 async function dshDispatch(bridge, input) {
   const { store, runner } = bridge.forWorkspace(input.workspace)
-  const task = await runner.dispatch(input)
+  const task = await runner.dispatch({
+    ...input,
+    codexThreadId: bridge.codexCallMeta?.threadId ?? null,
+  })
   if (input.requestId) {
     try {
       const request = store.loadRequest(input.requestId)
@@ -497,7 +509,7 @@ async function dshDispatch(bridge, input) {
     }
   }
   return {
-    text: `# DSH task started\n\n- **Task:** \`${task.taskId}\`\n- **State:** ${task.state}\n- **Session:** \`${task.sessionId}\`\n- **Packet:** \`${task.taskFile}\`\n\nDSH is now working in the shared workspace. Use \`dsh_wait\` (recommended) or \`dsh_status\` with this task id.`,
+    text: `# DSH task started\n\n- **Task:** \`${task.taskId}\`\n- **State:** ${task.state}\n- **Session:** \`${task.sessionId}\`\n- **Packet:** \`${task.taskFile}\`\n\nDSH is implementing Astra's plan in the shared workspace. When it settles, the bridge will queue a message into this same Codex thread; do not poll with \`dsh_wait\`. Use \`dsh_status\` only for diagnostics or when the user asks.`,
     structured: task,
   }
 }
@@ -649,6 +661,10 @@ function astraStatus(bridge, input) {
       attachQueueDir: runner.attachQueueDir,
       model: bridge.config.model,
       effort: bridge.config.effort,
+      codexThreadId: bridge.codexCallMeta?.threadId ?? process.env.CODEX_THREAD_ID ?? null,
+      codexSessionId: bridge.codexCallMeta?.sessionId ?? process.env.CODEX_SESSION_ID ?? null,
+      notifyCodex: bridge.config.notifyCodex !== false,
+      codexBin: bridge.config.codexBin,
       permissionMode: bridge.config.permissionMode,
       permissionPolicy: bridge.config.permissionPolicy,
     },
@@ -673,7 +689,9 @@ function astraStatus(bridge, input) {
     `- Board: \`${store.root}\``,
     `- DSH: \`${bridge.config.dshBin}\` (home \`${runner.dshHome}\`)${runner.dshHomeFallbackReason ? `\n- **Fallback:** ${runner.dshHomeFallbackReason}` : ''}\n- Attach queue: \`${runner.attachQueueDir ?? 'disabled (fallback home)'}\``,
     `- Model: ${bridge.config.model} · effort ${bridge.config.effort} · sandbox ${bridge.config.permissionMode} · ACP permission ${bridge.config.permissionPolicy}`,
-    `- Verification timeout: ${bridge.config.verifyTimeoutMs}ms · max 5 commands`, 
+    `- Verification timeout: ${bridge.config.verifyTimeoutMs}ms · max 5 commands`,
+    `- Codex thread: \`${payload.bridge.codexThreadId ?? 'unavailable'}\` · session: \`${payload.bridge.codexSessionId ?? 'unavailable'}\``,
+    `- Completion trigger: ${payload.bridge.notifyCodex ? `codex queue via \`${payload.bridge.codexBin ?? 'missing codex binary'}\`` : 'disabled'}`,
     `- ACP process: ${payload.acp.running ? `running (${payload.acp.sessions.length} session(s))` : 'not started'}`,
     `- Active turns: ${payload.acp.activeTurns.length ? payload.acp.activeTurns.join(', ') : 'none'}`,
     `- Lock: ${renderLock(payload.lock)}`,

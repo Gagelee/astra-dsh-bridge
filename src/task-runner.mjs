@@ -42,6 +42,9 @@ export class TaskRunner {
     this.active = new Map()
     this.cancelling = new Set()
     this.shuttingDown = false
+    this.waiters = new Map()
+    this.pendingNotifications = new Map()
+    this.notificationTimer = null
 
     // Prefer the configured DSH home (installed setups point at ~/.dsh so the
     // DSH GUI can list these sessions). If Codex's sandbox denies writes there,
@@ -271,11 +274,20 @@ export class TaskRunner {
     if (reviewMode === 'auto' && verifyCommands.length === 0) {
       throw new BridgeError('reviewMode=auto requires at least one verifyCommands entry', { code: 'BAD_TASK' })
     }
+    const taskKind = normalizeTaskKind(args.taskKind)
+    const implementationPlan = requireString(args.implementationPlan, 'implementationPlan')
+    const writeScopes = normalizeScopes(args.writeScopes)
+    if (taskKind === 'implement' && writeScopes.length === 0) {
+      throw new BridgeError('taskKind=implement requires at least one writeScopes entry', { code: 'BAD_TASK' })
+    }
     const packet = renderTaskPacket({
       ...args,
       title,
       goal,
       acceptance,
+      implementationPlan,
+      taskKind,
+      writeScopes,
       verifyCommands,
       workspace: this.store.workspace,
     })
@@ -283,11 +295,14 @@ export class TaskRunner {
       title,
       packet,
       requestId: args.requestId,
-      writeScopes: args.writeScopes,
+      writeScopes,
       model: args.model,
       effort: args.reasoningEffort ?? args.effort,
       reviewMode,
       verifyCommands,
+      taskKind,
+      implementationPlan,
+      codexThreadId: args.codexThreadId ?? null,
       runner: { instance: this.runnerId, pid: process.pid },
     })
 
@@ -331,6 +346,8 @@ export class TaskRunner {
     return {
       taskId: task.id,
       title: task.title,
+      taskKind: task.taskKind ?? 'implement',
+      implementationPlan: truncate(task.implementationPlan ?? '', 6000),
       state: task.state,
       sessionId: task.sessionId,
       taskFile: join(this.store.taskDir(task.id), 'task.md'),
@@ -513,6 +530,7 @@ export class TaskRunner {
         // A stale lock is reclaimable by the next dispatch.
       }
       this.active.delete(task.id)
+      this.notifyCodex(task)
 
       if (!this.shuttingDown && task.state !== 'cancelled' && task.queue.length > 0) {
         await this.startNextQueued(task)
@@ -609,6 +627,69 @@ export class TaskRunner {
       this.store.saveRequest(request)
     } catch {
       // A dangling request id must not fail the task.
+    }
+  }
+
+  /** Queue a same-thread Codex wake-up once a task needs Astra's attention. */
+  notifyCodex(task) {
+    if (this.config.notifyCodex === false) return
+    if (!this.config.codexBin || !task.codexThreadId) return
+    if (this.waiters.get(task.id)) return
+    if (!['idle', 'failed', 'interrupted'].includes(task.state)) return
+    if (task.queue?.length) return
+    const pending = this.pendingNotifications.get(task.codexThreadId) ?? new Set()
+    pending.add(task.id)
+    this.pendingNotifications.set(task.codexThreadId, pending)
+    if (this.notificationTimer === null) {
+      this.notificationTimer = setTimeout(() => {
+        this.notificationTimer = null
+        void this.flushNotifications()
+      }, 1500)
+      this.notificationTimer.unref?.()
+    }
+  }
+
+  /** Coalesce settled tasks per Codex thread and queue one message. */
+  async flushNotifications() {
+    if (this.shuttingDown) return
+    const pending = this.pendingNotifications
+    this.pendingNotifications = new Map()
+    for (const [threadId, ids] of pending) {
+      const tasks = [...ids].map((id) => {
+        try {
+          return this.store.loadTask(id)
+        } catch {
+          return null
+        }
+      }).filter(Boolean)
+      if (tasks.length === 0) continue
+      const summary = tasks.map((task) => `${task.id} (${task.state})`).join(', ')
+      const message = `DSH task${tasks.length > 1 ? 's' : ''} ${summary} settled in ${this.store.workspace}. Call dsh_result and dsh_review for ${tasks.length > 1 ? 'each' : 'it'}.`
+      let result
+      try {
+        result = await runCommand(this.config.codexBin, ['queue', '--thread', threadId, '--message', message], {
+          timeoutMs: 30_000,
+          maxBytes: 100_000,
+        })
+      } catch (error) {
+        for (const task of tasks) {
+          task.notifyError = truncate(error.message, 500)
+          this.store.appendEvent(task, { type: 'notify_failed', error: task.notifyError })
+          this.store.saveTask(task)
+        }
+        continue
+      }
+      for (const task of tasks) {
+        if (result.code === 0) {
+          task.notifiedAt = nowIso()
+          task.notifyError = null
+          this.store.appendEvent(task, { type: 'notify_queued', threadId })
+        } else {
+          task.notifyError = truncate((result.stderr || result.stdout || `exit ${result.code}`).trim(), 500)
+          this.store.appendEvent(task, { type: 'notify_failed', error: task.notifyError })
+        }
+        this.store.saveTask(task)
+      }
     }
   }
 
@@ -773,19 +854,26 @@ export class TaskRunner {
   /** Block until the current turn settles or the timeout expires. */
   async wait(taskId, timeoutMs, signal) {
     const deadline = Date.now() + timeoutMs
-    while (true) {
-      if (signal?.aborted) {
-        throw new BridgeError('wait cancelled by the client', { code: 'CANCELLED' })
+    this.waiters.set(taskId, (this.waiters.get(taskId) ?? 0) + 1)
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          throw new BridgeError('wait cancelled by the client', { code: 'CANCELLED' })
+        }
+        const task = this.store.loadTask(taskId)
+        this.reconcile(task)
+        if (!RUNNING.has(task.state)) {
+          return { ...this.statusPayload(task), timedOut: false }
+        }
+        if (Date.now() >= deadline) {
+          return { ...this.statusPayload(task), timedOut: true }
+        }
+        await sleep(300)
       }
-      const task = this.store.loadTask(taskId)
-      this.reconcile(task)
-      if (!RUNNING.has(task.state)) {
-        return { ...this.statusPayload(task), timedOut: false }
-      }
-      if (Date.now() >= deadline) {
-        return { ...this.statusPayload(task), timedOut: true }
-      }
-      await sleep(300)
+    } finally {
+      const remaining = (this.waiters.get(taskId) ?? 1) - 1
+      if (remaining > 0) this.waiters.set(taskId, remaining)
+      else this.waiters.delete(taskId)
     }
   }
 
@@ -837,6 +925,9 @@ export class TaskRunner {
       dshHome: this.dshHome,
       dshHomeFallbackReason: this.dshHomeFallbackReason,
       attachQueueDir: this.attachQueueDir,
+      codexThreadId: task.codexThreadId ?? null,
+      notifiedAt: task.notifiedAt ?? null,
+      notifyError: task.notifyError ?? null,
       verification: task.verification ?? null,
       autoReview: task.autoReview ?? null,
       queueLength: task.queue?.length ?? 0,
@@ -864,6 +955,8 @@ export class TaskRunner {
       taskId: task.id,
       state: task.state,
       title: task.title,
+      taskKind: task.taskKind ?? 'implement',
+      implementationPlan: truncate(task.implementationPlan ?? '', 6000),
       sessionId: task.sessionId,
       finalText: truncate(task.finalText ?? '', 60_000),
       questions: extractQuestions(task.finalText),
@@ -921,6 +1014,7 @@ export class TaskRunner {
     return tasks.map((task) => ({
       taskId: task.id,
       title: task.title,
+      taskKind: task.taskKind ?? 'implement',
       state: task.state,
       turn: task.turnIndex,
       updatedAt: task.updatedAt,
@@ -944,6 +1038,22 @@ export class TaskRunner {
     this.client = null
     this.clientPromise = null
   }
+}
+
+function normalizeTaskKind(value) {
+  if (value === undefined || value === null || value === '') return 'implement'
+  if (!['implement', 'verify'].includes(value)) {
+    throw new BridgeError('taskKind must be implement or verify', { code: 'BAD_TASK' })
+  }
+  return value
+}
+
+function normalizeScopes(value) {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value)) {
+    throw new BridgeError('writeScopes must be an array of workspace-relative paths', { code: 'BAD_TASK' })
+  }
+  return value.map((entry) => String(entry ?? '').trim()).filter(Boolean)
 }
 
 function normalizeReviewMode(value) {

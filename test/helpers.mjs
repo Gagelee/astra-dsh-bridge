@@ -9,6 +9,8 @@ import { tmpdir } from 'node:os'
 
 export const MOCK_ACP = fileURLToPath(new URL('./fixtures/mock-acp-agent.mjs', import.meta.url))
 export const SERVER = fileURLToPath(new URL('../src/mcp-server.mjs', import.meta.url))
+export const MOCK_CODEX = fileURLToPath(new URL('./fixtures/mock-codex.mjs', import.meta.url))
+export const MOCK_CODEX_OUT = (workspace) => `${workspace}.mock-codex-calls.jsonl`
 
 export async function makeWorkspace(prefix = 'astra-dsh-test-') {
   return mkdtemp(join(tmpdir(), prefix))
@@ -57,8 +59,19 @@ export function startMcp({ cwd, env = {} } = {}) {
     })
   }
 
-  async function call(name, args, timeoutMs = 60_000) {
-    const result = await request('tools/call', { name, arguments: args }, timeoutMs)
+  async function call(name, args, timeoutMs = 60_000, meta) {
+    const effective = name === 'dsh_dispatch'
+      ? {
+        implementationPlan: 'Implement the requested outcome.',
+        writeScopes: ['dsh-output.txt'],
+        ...args,
+      }
+      : args
+    const result = await request('tools/call', {
+      name,
+      arguments: effective,
+      ...(meta === undefined ? {} : { _meta: meta }),
+    }, timeoutMs)
     return {
       text: result.content?.[0]?.text ?? '',
       structured: result.structuredContent,
@@ -80,5 +93,9 @@ export function startMcp({ cwd, env = {} } = {}) {
     })
   }
 
-  return { child, request, call, close, stderr, notifications }
+  async function callWithMeta(name, args, meta, timeoutMs = 60_000) {
+    return call(name, args, timeoutMs, meta)
+  }
+
+  return { child, request, call, callWithMeta, close, stderr, notifications }
 }

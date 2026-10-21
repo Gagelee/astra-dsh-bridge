@@ -19,10 +19,23 @@ function findDshBinary(env) {
 }
 
 /** All deployment knobs in one place; every value has a safe default. */
+function findCodex(env) {
+  if (env.ASTRA_DSH_CODEX_BIN) return env.ASTRA_DSH_CODEX_BIN
+  const candidates = [
+    join(homedir(), '.local', 'bin', 'codex'),
+    '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+    '/opt/homebrew/bin/codex',
+    '/usr/local/bin/codex',
+  ]
+  return candidates.find((candidate) => existsSync(candidate)) ?? null
+}
+
 export function loadConfig(env = process.env) {
   return {
     bridgeHome: env.ASTRA_DSH_HOME || join(homedir(), 'astra-dsh-bridge'),
     dshBin: findDshBinary(env),
+    codexBin: findCodex(env),
+    notifyCodex: env.ASTRA_DSH_NOTIFY_CODEX !== '0',
     dshHome: env.ASTRA_DSH_DSH_HOME || null,
     credentialsSource: env.ASTRA_DSH_CREDENTIALS || join(homedir(), '.dsh', '.credentials.yaml'),
     model: env.ASTRA_DSH_MODEL || 'deepseek-v4-pro',

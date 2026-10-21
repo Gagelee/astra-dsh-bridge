@@ -50,7 +50,9 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 
 命中风险清单才升级 `full`；不要为了“保险”把所有任务都设成 `full`，那会显著增加你的验收轮数和上下文消耗。
 
-## 1. 规划与拆解
+## 1. 规划与拆解（Astra 的职责）
+
+**分工契约：Astra 分析问题、定方向/优先级、写实施计划；DSH 按计划动手修改。** DSH 可以在实现过程中读代码、分析边界条件、提出调整建议，但不能另起一套产品分析或路线图；它交付的是代码/文件改动和验证结果，不是分析报告。
 
 1. 先读项目：入口、相关模块、测试、现有约定。不要凭想象写任务包。
 2. 把需求拆成**可独立验收**的任务；明确依赖顺序。默认一次只派发一个任务，等验收后再派下一个。
@@ -67,7 +69,9 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 {
   "workspace": "/abs/project",
   "title": "短标题",
-  "goal": "一段话说明最终结果",
+  "taskKind": "implement",
+  "goal": "一段话说明要实现的结果",
+  "implementationPlan": "Astra 的实施计划：改哪些文件、按什么步骤、边界是什么。DSH 按此执行，可补充实现级分析。",
   "context": "背景、历史决策、用户约束、项目理解（markdown）",
   "files": ["src/app.ts — 入口", "src/report.ts — 报表页"],
   "constraints": ["不新增依赖", "保持现有 API"],
@@ -85,7 +89,9 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 
 要求：
 
-- `goal` 与 `acceptance` 必填；验收标准必须能被检查（文件存在、测试通过、行为改变），不要写“质量好”。
+- `goal`、`implementationPlan` 与 `acceptance` 必填；`taskKind=implement` 还必须有 `writeScopes`。
+- `implementationPlan` 是 Astra 的分析结论和实施方向，不是让 DSH 重新做规划；DSH 可以在此基础上做实现级分析。
+- 验收标准必须能被检查（文件存在、测试通过、行为改变），不要写“质量好”。
 - `context` 写决策和事实，不写你的内部推理过程。
 - `files` 给路径和用途；`writeScopes` 给预计会改的路径，便于发现冲突。
 - 需要 DSH 自行判断的开放问题，在 `context`/`notes` 里说明边界，不要留空。
@@ -100,24 +106,26 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 - 如果你需要自己改文件（例如先补测试或调整计划），先 `astra_lock action=acquire`，改完 `astra_lock action=release`，再派发 DSH。
 - 如果 `dsh_dispatch` 报 `LOCK_HELD`，先看锁的 owner：是 `astra` 就释放；是 `dsh` 就等当前回合结束。
 - 不要让两个 DSH 任务同时写同一批文件；确实要并行时，`writeScopes` 必须不重叠，并接受串行派发的默认行为。
+- **DSH 的交付文件归 DSH**：验收时发现实现问题，发回 `dsh_review changes_requested` / `dsh_message`，不要自己拿 `astra_lock` 改 DSH 的产物。
 
 ## 4. 执行循环与验收分级
 
-标准循环：
+标准循环（触发式，不轮询）：
 
-1. `dsh_wait`（推荐，`timeoutSec` 最大 300）等当前回合结束；超时只代表还在跑，不是失败。
-2. 运行中可随时 `dsh_status` 看 phase、最近工具、最近文本、问题、变更文件、verification 进度。
-3. 回合结束后 `dsh_result` 读完整报告、verification 与问题。
-4. 根据 `reviewMode` 签收：
+1. `dsh_dispatch` 后**结束本轮回合**，不要 `dsh_wait`。桥在任务 settle 时会用 `codex queue` 往**同一个 Codex thread** 投一条消息，唤醒你。
+2. 被唤醒后 `dsh_status` / `dsh_result` 读取状态、verification、问题、变更。
+3. 根据 `reviewMode` 签收：
    - `auto`：桥已独立跑 `verifyCommands`；若 `state=accepted` 且 `autoReview.eligible=true`，可以直接进入下一任务，但仍建议在交付前抽检关键文件。
    - `light`：看 `dsh_diff` 与 `dsh_read_file`，确认改动范围和结果；通常不必重跑全套测试。
    - `full`：打开真实文件、跑必要测试、核对所有验收标准；不要只信 DSH 的总结。
-5. 若 `autoReview.eligible=false`，读 `autoReview.reasons`：常见原因是验证失败、DSH 提问、改动越出 `writeScopes`、有排队指令。按原因决定回答、返工或重新拆任务。
-6. 记录结论：
+4. 若 `autoReview.eligible=false`，读 `autoReview.reasons`：常见原因是验证失败、DSH 提问、改动越出 `writeScopes`、有排队指令。按原因决定回答、返工或重新拆任务。
+5. 记录结论：
    - 通过：`dsh_review decision=accepted`（`auto` 已自动记录时不必重复）。
-   - 要返工：`dsh_review decision=changes_requested notes=... continueTask=true`，或先 `dsh_message` 再 review。
+   - 要返工：`dsh_review decision=changes_requested notes=... continueTask=true`，或先 `dsh_message` 再 review。**不要自己改 DSH 的交付文件**；把具体修正点发回 DSH。
    - 方向错误：`dsh_review decision=rejected`，必要时 `dsh_cancel`。
-7. 验收通过后，再派发下一个依赖任务。
+6. 验收通过后，再派发下一个依赖任务。
+
+`dsh_wait` 只是诊断/兜底工具，正常流程不要使用；如果用了，桥会抑制完成通知以避免双唤醒。
 
 ### 验收分级怎么选
 
@@ -140,11 +148,11 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 
 ### 等待与额度
 
-- `dsh_wait` 是阻塞工具调用：等待时不产生模型 token，但每次超时返回都会带来一轮新的思考。不要循环 `dsh_wait`/`dsh_status`。
-- 预计 5 分钟内完成：一次 `dsh_wait` 180–300 秒。
-- 预计更长：`dsh_dispatch` 后先结束回合，告诉用户“DSH 在跑”；用户回来或稍后再查一次 `dsh_status`。
-- 桥会在回合结束后主动跑 `verifyCommands`，这是本地执行，不消耗模型额度；`auto` 模式自动签收，省掉 Astra 的验收轮。
-- DSH 不会主动唤醒 Codex；MCP 是拉取模型。需要完成提醒时用本地通知，不要让 Astra 轮询。
+- 不等待、不轮询。`dsh_dispatch` 后结束回合；任务 settle 后桥用 `codex queue --thread <当前 thread>` 唤醒同一会话，只产生一轮新的 Astra，不新建 session。
+- `codex queue` 的 thread id 来自 Codex 每次 MCP 调用 `_meta.threadId`，不需要固定会话名。
+- 多个任务同时完成会合并成一条通知；`auto` 已签收或 `cancelled` 的任务不唤醒。
+- 桥在回合结束后主动跑 `verifyCommands`（本地进程，不消耗模型 token）。
+- 如果触发失败，任务仍在板上，记录 `notifyError`；用户/你可以稍后 `dsh_status` 查看，不要改回轮询循环。
 
 ### 需求确认 reviewer（可选，默认不启用）
 
@@ -184,7 +192,7 @@ Astra 拿到 `PASS` 后再 `dsh_review accepted`；`FAIL` 就把 `GAPS` 转成 `
 
 ### 回答 DSH 的问题
 
-`dsh_result.questions` 或状态里的 `QUESTION:` 行是 DSH 在等决策。用 `dsh_message` 回答，尽量给明确选项和约束；回答后 `dsh_wait` 等下一回合。
+`dsh_result.questions` 或状态里的 `QUESTION:` 行是 DSH 在等决策。用 `dsh_message` 回答，尽量给明确选项和约束；回答后同样等待完成触发，不要 `dsh_wait` 轮询。
 
 ### 追加指令 / 打断
 
@@ -225,7 +233,7 @@ Astra 拿到 `PASS` 后再 `dsh_review accepted`；`FAIL` 就把 `GAPS` 转成 `
 | 自己写文件前 | `astra_lock acquire` / `release` |
 | 派发 | `dsh_dispatch` |
 | 看进度 | `dsh_status` |
-| 等回合 | `dsh_wait` |
+| 诊断等待（不常用） | `dsh_wait` |
 | 回答/追加/打断 | `dsh_message` |
 | 停止 | `dsh_cancel` |
 | 读报告 | `dsh_result` |

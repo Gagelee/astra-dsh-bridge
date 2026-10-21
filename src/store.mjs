@@ -148,7 +148,7 @@ export class WorkspaceStore {
   }
 
   /** Create a task record and its human-readable packet. */
-  createTask({ title, packet, requestId, writeScopes, model, effort, runner, reviewMode, verifyCommands }) {
+  createTask({ title, packet, requestId, writeScopes, model, effort, runner, reviewMode, verifyCommands, taskKind, implementationPlan, codexThreadId }) {
     const id = timestampId('T')
     const createdAt = nowIso()
     const task = {
@@ -156,6 +156,11 @@ export class WorkspaceStore {
       id,
       workspace: this.workspace,
       title,
+      taskKind: taskKind ?? 'implement',
+      implementationPlan: implementationPlan ?? '',
+      codexThreadId: codexThreadId ?? null,
+      notifiedAt: null,
+      notifyError: null,
       state: 'created',
       phase: 'packet-ready',
       createdAt,
