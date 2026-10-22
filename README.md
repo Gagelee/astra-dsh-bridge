@@ -9,6 +9,18 @@
 - Astra 可以查询进度、追加指令、打断、取消、要求返工，并直接读取共享目录审阅改动。
 - 需求可以从 Codex 发起，也可以从 DSH 发起：DSH 把需求写进同一块任务板，Astra 用 `astra_inbox` pickup。
 
+## 为什么做这个项目
+
+这个项目来自一个实践观察：**让强规划模型（Codex/Astra）负责分析、拆解和验收，让 DeepSeek Flash 负责执行，成功率通常高于让同一个模型既规划又执行。**
+
+不是让 DSH 变成更强的规划者，而是把“规划”和“执行”拆开：
+
+- Astra 用 Codex 的强推理、项目上下文和工具，决定做什么、先后顺序和验收标准；
+- DSH/Flash 在共享目录里动手改，成本低、回合快；
+- 桥负责任务包、锁、进度、通知、验收和真实文件交付。
+
+所以推荐用法是“Astra 规划优先”，但**本质上是把 Codex 和 DSH 连起来**：你可以只用其中一个，也可以把任意一侧作为入口。
+
 ```
 Codex / Astra ──MCP(stdio)──▶ astra-dsh bridge ──Unix socket──▶ DSH GUI host（原生 live session）
       │                              │
