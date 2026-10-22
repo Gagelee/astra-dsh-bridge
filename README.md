@@ -314,6 +314,8 @@ Codex 发起的任务会出现在 DSH GUI 的会话列表里：
 | `ASTRA_DSH_PERMISSION_POLICY` | `allow` | ACP 权限升级请求：`allow` 保持无人值守执行；`reject` 失败关闭 |
 | `ASTRA_DSH_WAIT_MAX_SEC` | `300` | `dsh_wait` 诊断上限 |
 | `ASTRA_DSH_NOTIFY_CODEX` | `1` | 任务 settle 时是否用 `codex queue` 触发同一 thread；`0` 关闭 |
+| `ASTRA_DSH_EXECUTION_BACKEND` | `auto` | `auto` / `host` / `acp`；host control 可用时走 GUI host，否则 ACP |
+| `ASTRA_DSH_HOST_SOCKET` | `~/.dsh/astra-dsh/host-control.sock` | host control Unix socket |
 | `ASTRA_DSH_CODEX_BIN` | 自动探测 Codex app CLI | `codex queue` 使用的 CLI 路径 |
 | `ASTRA_DSH_LOCK_TTL_MS` | 2h | DSH 回合锁租期 |
 | `ASTRA_DSH_VERIFY_TIMEOUT_MS` | `120000` | 每条 `verifyCommands` 的超时 |
