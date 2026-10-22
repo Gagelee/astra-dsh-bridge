@@ -10,10 +10,13 @@
 - 需求可以从 Codex 发起，也可以从 DSH 发起：DSH 把需求写进同一块任务板，Astra 用 `astra_inbox` pickup。
 
 ```
-Codex / Astra  ──MCP(stdio)──▶  astra-dsh bridge  ──ACP(stdio)──▶  dsh acp（持久会话）
-      │                              │                                   │
+Codex / Astra ──MCP(stdio)──▶ astra-dsh bridge ──Unix socket──▶ DSH GUI host（原生 live session）
+      │                              │
+      │                              └──ACP(stdio)──▶ dsh acp（GUI 不在时的 fallback）
       └──────────── 共享工作目录 <workspace>/.astra-dsh/ ◀───────────────┘
 ```
+
+`executionBackend=auto`（默认）：GUI host control 可用时走 host，session 由 GUI 拥有并原生 live；不可用时自动回退 ACP（headless/CI）。
 
 ## 快速开始
 
@@ -23,7 +26,12 @@ node install.mjs --dry-run   # 预览将要写入的文件
 node install.mjs --yes       # 安装 Codex MCP 配置、Codex skill、DSH skill
 ```
 
-GUI 自动归组插件 `@astra-dsh/workspace-attach` 已从 `gui-plugin/` 安装到当前的 desktop profile；如果重装 profile，需要在 Harness 的 Plugin Manager 里重新安装这个本地 bundle（见 `gui-plugin/README.md`）。
+GUI 插件已从本地目录安装到 desktop profile：
+
+- `@astra-dsh/workspace-attach`（`gui-plugin/`）：外部 ACP session 的发布/归组
+- `@astra-dsh/host-control`（`host-plugin/`）：GUI 内 host-owned session 的控制面（Unix socket）
+
+如果重装 profile，需要在 Harness 的 Plugin Manager 里重新安装这两个本地 bundle（见各自的 README）。host session 沿用 GUI 的 DSH 权限 preset；`approval/policy=ask` 时文件写入可能需要在 DSH GUI 里批准，这并不是 bridge 的自动授权。
 
 安装后重启 Codex，在项目里说：
 

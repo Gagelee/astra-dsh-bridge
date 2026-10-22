@@ -563,7 +563,7 @@ async function dshDispatch(bridge, input, meta) {
     }
   }
   return {
-    text: `# DSH task started\n\n- **Task:** \`${task.taskId}\`\n- **State:** ${task.state}\n- **Session:** \`${task.sessionId}\`\n- **GUI policy:** ${task.guiPolicy}\n- **Monitor:** ${task.monitor?.watchdog ?? 'unknown'}${task.degraded?.length ? `\n- **DEGRADED:** ${task.degraded.join('; ')}` : ''}\n- **Packet:** \`${task.taskFile}\`\n\nDSH is implementing Astra's plan in the shared workspace. When it settles, the bridge will queue a message into this same Codex thread via \`codex queue --thread\`; do not poll with \`dsh_wait\`. Use \`dsh_status\` only for diagnostics or when the user asks.`,
+    text: `# DSH task started\n\n- **Task:** \`${task.taskId}\`\n- **State:** ${task.state}\n- **Session:** \`${task.sessionId}\`\n- **Backend:** ${task.executionBackend ?? 'acp'}${task.live ? ' (native live GUI session)' : ''}\n- **GUI policy:** ${task.guiPolicy}\n- **Monitor:** ${task.monitor?.watchdog ?? 'unknown'}${task.degraded?.length ? `\n- **DEGRADED:** ${task.degraded.join('; ')}` : ''}\n- **Packet:** \`${task.taskFile}\`\n\nDSH is implementing Astra's plan in the shared workspace. When it settles, the bridge will queue a message into this same Codex thread via \`codex queue --thread\`; do not poll with \`dsh_wait\`. Use \`dsh_status\` only for diagnostics or when the user asks.`,
     structured: task,
   }
 }

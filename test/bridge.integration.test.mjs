@@ -16,6 +16,7 @@ function mockEnv(workspace) {
     ASTRA_DSH_MODEL: 'mock-model',
     ASTRA_DSH_EFFORT: 'low',
     ASTRA_DSH_PERMISSION_POLICY: 'allow',
+    ASTRA_DSH_EXECUTION_BACKEND: 'acp',
     ASTRA_DSH_CODEX_BIN: MOCK_CODEX,
     ASTRA_DSH_NOTIFY_CODEX: '1',
     MOCK_CODEX_OUT: MOCK_CODEX_OUT(workspace),

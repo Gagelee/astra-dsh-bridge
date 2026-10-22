@@ -11,9 +11,19 @@
 - `astra_status` 显示 `Execution backend` 与 host control 的版本/协议/可用性。
 - 测试：`test/host-control.test.mjs`、`test/host-client.test.mjs`。
 
-## 尚未完成
+## 已接入（2026-10-22）
 
-`dsh_dispatch` 仍走 ACP；`executionBackend=auto|host|acp` 只做了配置/探测入口，host 执行分支尚未接入 `TaskRunner`。所以当前 live 仍不成立。
+- `TaskRunner` 在 dispatch 时探测 host；`auto` 可用则走 host，不可用回退 ACP；`host` 强制、`acp` 强制。
+- host 分支：`create`（session+model+prompt）→ `follow`（解析 snapshot/live `event` 包装、assistant/message、turn/end）→ 复用 verification/auto-review/result/outbox/lock。
+- 同一 host session 的 follow-up（`dsh_message`）走 `prompt`，不新建 session。
+- `dsh_cancel` 对 host 调 `cancel` 并 abort follow。
+- 真实 GUI host smoke：`executionBackend=host`、`live=true`、`sessionId=session-*`、任务从 running → idle、result 含 `HOST_LIVE_OK`。
+
+## 尚未完成 / 边界
+
+- host 任务在 bridge 退出后的自动 reconcile 尚未实现；host session 可能仍在跑，任务会保持 running（与 ACP 的 owner-exited 路径不同）。这是下一步。
+- host 权限沿用 GUI 的 DSH preset（`approval/policy=ask` 时可能需要 GUI 批准）；bridge 不能替用户批准。
+- 真实客户端渲染/肉眼 live 仍需在 GUI 里确认；host API 层已证明 session 是 host-owned 且 follow 有事件。
 
 ## 接入约定
 

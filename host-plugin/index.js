@@ -82,6 +82,17 @@ export function apply(ctx, options = {}) {
     })
     const sessionId = created?.sessionId
     if (!sessionId) throw Object.assign(new Error('host did not return a sessionId'), { code: 'HOST_ERROR' })
+    let attached = false
+    try {
+      const workspace = await ctx.workspaceRegistry.resolveByPath(cwd)
+      if (workspace) {
+        await workspace.attachSession(sessionId)
+        attached = true
+      }
+    } catch (error) {
+      // Grouping is best effort; the host-owned Session is still live without it.
+      console.warn(`[astra-dsh-host-control] workspace attach failed: ${error?.message ?? error}`)
+    }
     let selected = null
     if (typeof params?.model === 'string' && params.model) {
       const provider = typeof params?.provider === 'string' && params.provider ? params.provider : 'deepseek-official'
@@ -102,9 +113,9 @@ export function apply(ctx, options = {}) {
         mode: 'queue',
         content: [{ type: 'text', text: params.prompt }],
         clientTimeZone: typeof params?.clientTimeZone === 'string' ? params.clientTimeZone : undefined,
-      })
+      }, new AbortController().signal)
     }
-    return { sessionId, agentPreset: created.agentPreset ?? null, selected, protocol: PROTOCOL }
+    return { sessionId, agentPreset: created.agentPreset ?? null, selected, attached, protocol: PROTOCOL }
   }
 
   async function prompt(params) {
@@ -117,7 +128,7 @@ export function apply(ctx, options = {}) {
       mode: params?.mode === 'steer' ? 'steer' : 'queue',
       content: [{ type: 'text', text }],
       clientTimeZone: typeof params?.clientTimeZone === 'string' ? params.clientTimeZone : undefined,
-    })
+    }, new AbortController().signal)
     return { accepted: true }
   }
 

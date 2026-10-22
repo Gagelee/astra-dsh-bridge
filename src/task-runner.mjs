@@ -7,6 +7,7 @@
 import { accessSync, constants, copyFileSync, existsSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { AcpClient } from './acp-client.mjs'
+import { HostControlClient, probeHostControl } from './host-client.mjs'
 import {
   ATTACH_STATUS,
   DEFAULT_GUI_POLICY,
@@ -68,6 +69,7 @@ export class TaskRunner {
     this.runnerId = shortId(4)
     this.client = null
     this.clientPromise = null
+    this.host = new HostControlClient(config.hostSocket, { connectTimeoutMs: config.hostProbeTimeoutMs, requestTimeoutMs: 30_000 })
     this.clients = new Set()
     this.active = new Map()
     this.cancelling = new Set()
@@ -629,6 +631,304 @@ export class TaskRunner {
     }
   }
 
+  /** Choose host execution when the GUI control plane is healthy; ACP otherwise. */
+  async selectExecutionBackend() {
+    const configured = this.config.executionBackend ?? 'auto'
+    if (configured === 'acp') return { backend: 'acp' }
+    const health = await probeHostControl(this.config.hostSocket, { timeoutMs: this.config.hostProbeTimeoutMs })
+    const usable = health.available === true
+      && health.protocol === 1
+      && Array.isArray(health.capabilities)
+      && health.capabilities.includes('session.create')
+      && health.capabilities.includes('session.follow')
+    if (usable) return { backend: 'host', health }
+    if (configured === 'host') {
+      throw new BridgeError(
+        `ASTRA_DSH_EXECUTION_BACKEND=host but host control is unavailable: ${health.error ?? 'protocol/capability mismatch'}`,
+        { code: 'HOST_UNAVAILABLE', details: health },
+      )
+    }
+    return { backend: 'acp', reason: health.error ?? 'host control unavailable' }
+  }
+
+  /** Begin a host-owned turn. The host Agent owns the Session; the bridge only follows it. */
+  async startHostTurn(task, prompt, { lockToken, userMessage = null, create = true } = {}) {
+    if (this.active.has(task.id)) {
+      throw new BridgeError(`task ${task.id} already has a turn in flight`, { code: 'TASK_RUNNING' })
+    }
+    task.turnIndex += 1
+    task.state = 'running'
+    task.phase = 'host:starting'
+    task.executionBackend = 'host'
+    task.live = true
+    task.startedAt = task.startedAt ?? nowIso()
+    task.endedAt = null
+    task.stopReason = null
+    task.error = null
+    task.finalText = ''
+    task.lastAssistantText = ''
+    task.verification = null
+    task.autoReview = null
+    task.review = null
+    task.incident = null
+    task.executionMayBeActive = false
+    task.lastTool = null
+    task.lastHostUpdateAt = nowIso()
+    task.queueMessage = userMessage
+    task.runner = {
+      ...(task.runner ?? {}),
+      instance: this.runnerId,
+      pid: process.pid,
+      turn: task.turnIndex,
+      startedAt: nowIso(),
+      lastHeartbeatAt: nowIso(),
+      backend: 'host',
+    }
+    this.store.saveTask(task)
+    this.store.writeTurn(task, task.turnIndex, 'prompt.md', prompt)
+    this.store.appendEvent(task, { type: 'turn_start', turn: task.turnIndex, promptChars: prompt.length, followUp: userMessage !== null, backend: 'host' })
+
+    let created = null
+    try {
+      if (create) {
+        created = await this.host.request('create', {
+          cwd: this.store.workspace,
+          model: task.model || this.config.model,
+          provider: this.config.modelProvider,
+          reasoningEffort: task.effort || this.config.effort,
+          prompt,
+        }, { timeoutMs: 60_000 })
+        task.sessionId = created.sessionId
+        task.hostSessionId = created.sessionId
+        task.modelSelection = created.selected ? 'host-selected' : 'host-unverified'
+        task.actualModel = created.selected ? `${created.selected.provider ?? this.config.modelProvider}/${created.selected.model ?? (task.model || this.config.model)}` : null
+        task.requestedModel = `${this.config.modelProvider}/${task.model || this.config.model}`
+        task.modelError = created.selected ? null : 'host did not return a selected model'
+        this.store.appendEvent(task, {
+          type: 'host_session',
+          sessionId: task.sessionId,
+          requestedModel: task.requestedModel,
+          actualModel: task.actualModel,
+        })
+      } else {
+        if (!task.sessionId) throw new BridgeError('host follow-up has no sessionId', { code: 'HOST_NO_SESSION' })
+        await this.host.request('prompt', { sessionId: task.sessionId, text: prompt }, { timeoutMs: 30_000 })
+        this.store.appendEvent(task, { type: 'host_prompt', sessionId: task.sessionId, followUp: true })
+      }
+    } catch (error) {
+      task.state = 'failed'
+      task.phase = 'failed'
+      task.error = `${create ? 'host session creation' : 'host prompt'} failed: ${error?.message ?? String(error)}`
+      task.stopReason = 'failed'
+      task.executionMayBeActive = false
+      this.store.appendEvent(task, { type: create ? 'host_create_failed' : 'host_prompt_failed', error: truncate(task.error, 1000) })
+      this.store.releaseLock(lockToken)
+      this.store.saveTask(task)
+      throw new BridgeError(task.error, { code: error?.code ?? 'HOST_CREATE_FAILED', details: error?.details ?? null })
+    }
+    task.hostTurn = task.turnIndex
+    task.phase = 'host:running'
+    this.store.saveTask(task)
+
+    const entry = {
+      task,
+      sessionId: task.sessionId,
+      lockToken,
+      startedAt: Date.now(),
+      backend: 'host',
+      controller: new AbortController(),
+      promise: null,
+    }
+    this.active.set(task.id, entry)
+    entry.promise = this.runHostTurn(task, entry)
+    return entry
+  }
+
+  /** Follow a host-owned turn until turn/end, then settle through the common path. */
+  async runHostTurn(task, entry) {
+    const current = { text: '', lastMessage: '', turnEnded: false, stopReason: null, error: null, lastTool: null }
+    try {
+      for await (const frame of this.host.follow(task.sessionId, { signal: entry.controller.signal })) {
+        this.onHostFrame(task, current, frame)
+        if (current.turnEnded) break
+      }
+      if (!current.turnEnded) {
+        throw new BridgeError('host follow stream ended before turn/end', { code: 'HOST_FOLLOW_ENDED' })
+      }
+      task.stopReason = current.stopReason ?? 'unknown'
+      task.finalText = current.lastMessage || current.text
+      task.lastAssistantText = truncate(task.finalText, 6000)
+      task.executionMayBeActive = false
+      if (current.stopReason === 'cancelled' || task.stopReason === 'cancelled') {
+        task.state = 'cancelled'
+        task.phase = 'cancelled'
+        task.cancelConfirmed = true
+      } else if (current.error || current.stopReason === 'error') {
+        task.state = 'failed'
+        task.phase = 'failed'
+        task.error = current.error ?? 'host turn failed'
+      } else {
+        task.state = 'idle'
+        task.phase = 'host:awaiting-astra'
+      }
+    } catch (error) {
+      const cancelled = this.cancelling.has(task.id)
+      task.state = cancelled ? 'cancelled' : 'interrupted'
+      task.phase = cancelled ? 'cancelled' : 'interrupted'
+      task.stopReason = cancelled ? 'cancelled' : 'interrupted'
+      task.error = cancelled
+        ? 'host turn was cancelled'
+        : `host follow failed before turn/end; the host Agent may still be running. ${error?.message ?? String(error)}`.trim()
+      task.finalText = current.lastMessage || current.text || ''
+      task.lastAssistantText = truncate(task.finalText, 6000)
+      task.executionMayBeActive = !cancelled
+      task.cancelConfirmed = cancelled
+      this.store.appendEvent(task, {
+        type: 'host_incident',
+        errorCode: error?.code ?? 'HOST_FOLLOW_ERROR',
+        error: truncate(task.error, 1000),
+        executionMayBeActive: task.executionMayBeActive,
+      })
+      if (cancelled) this.cancelling.delete(task.id)
+    } finally {
+      await this.settleHostTurn(task, { current, lockToken: entry.lockToken })
+      this.active.delete(task.id)
+      if (task.state === 'idle' && !this.shuttingDown && task.queue?.length > 0) {
+        await this.startNextQueued(task)
+      }
+    }
+  }
+
+  /** Turn host frames into the same task fields the ACP path exposes. */
+  onHostFrame(task, current, frame) {
+    task.lastHostUpdateAt = nowIso()
+    task.lastAcpUpdateAt = task.lastHostUpdateAt
+    task.runner = { ...(task.runner ?? {}), lastHeartbeatAt: nowIso() }
+    // Live durable frames arrive wrapped as { type: 'event', event }, while
+    // snapshot records use the same wrapper. Unwrap before classifying.
+    if (frame?.type === 'event' && frame.event) {
+      this.onHostFrame(task, current, frame.event)
+      return
+    }
+    const frameTurn = frame?.data?.turn
+    if (Number.isInteger(frameTurn) && Number.isInteger(task.hostTurn) && frameTurn < task.hostTurn) return
+    if (frame?.type === 'snapshot') {
+      for (const record of Array.isArray(frame.records) ? frame.records : []) {
+        // Host history records wrap the durable event: { type: 'event', event }.
+        this.onHostFrame(task, current, record?.event ?? record)
+      }
+      return
+    }
+    if (frame?.type === 'assistant/message') {
+      const message = frame?.data?.message
+      const parts = Array.isArray(message?.content) ? message.content : []
+      const text = parts.filter((part) => part?.type === 'text').map((part) => part.text).join('\n').trim()
+      if (text) {
+        current.text = current.text ? `${current.text}\n${text}` : text
+        current.lastMessage = text
+        task.lastAssistantText = truncate(current.lastMessage, 6000)
+        task.phase = 'host:assistant'
+      }
+      return
+    }
+    if (frame?.type === 'turn/end') {
+      current.turnEnded = true
+      const reason = frame?.data?.reason ?? {}
+      current.stopReason = reason.kind ?? 'unknown'
+      if (reason.kind === 'error') current.error = reason.error?.message ?? reason.error ?? 'host turn failed'
+      task.phase = 'host:turn-end'
+      return
+    }
+    if (typeof frame?.type === 'string' && frame.type.startsWith('tool/')) {
+      current.lastTool = frame?.data?.name ?? frame?.data?.tool ?? frame.type
+      task.lastTool = current.lastTool
+      task.phase = `host:tool:${current.lastTool}`
+    }
+  }
+
+  /** Settle a host turn through verification, auto-review, result, notification and lock release. */
+  async settleHostTurn(task, { current, lockToken }) {
+    let changes = null
+    let verification = null
+    try {
+      changes = await this.store.collectChanges(task.baseline)
+      task.changedFiles = changes.changedFiles
+      task.diffStat = changes.diffStat
+      task.headAfter = changes.headAfter ?? task.headAfter
+      this.store.writeTaskText(task, 'changes.json', `${JSON.stringify(changes, undefined, 2)}\n`)
+    } catch (error) {
+      this.store.appendEvent(task, { type: 'changes_failed', error: truncate(error.message, 500) })
+    }
+    if (task.verifyCommands?.length > 0 && task.state !== 'cancelled' && !task.executionMayBeActive) {
+      try {
+        verification = await this.runVerification(task)
+        task.verification = verification
+      } catch (error) {
+        verification = { ranAt: nowIso(), ok: false, error: truncate(error.message, 500), checks: [] }
+        task.verification = verification
+        this.store.appendEvent(task, { type: 'verification_failed', error: truncate(error.message, 500) })
+      }
+    }
+    if (task.reviewMode === 'auto' && task.state === 'idle') {
+      try {
+        const auto = this.evaluateAutoReview(task, verification, changes)
+        task.autoReview = auto
+        if (auto.eligible) {
+          task.state = 'accepted'
+          task.phase = 'accepted'
+          task.review = { decision: 'accepted', mode: 'auto', notes: auto.notes, at: nowIso() }
+          this.writeReviewArtifact(task)
+          this.markRequestState(task, 'done')
+          this.store.appendEvent(task, { type: 'auto_review', decision: 'accepted', checks: verification?.checks?.length ?? 0 })
+        } else {
+          this.store.appendEvent(task, { type: 'auto_review_skipped', reasons: auto.reasons })
+        }
+      } catch (error) {
+        this.store.appendEvent(task, { type: 'auto_review_error', error: truncate(error.message, 500) })
+      }
+    }
+    try {
+      const questions = extractQuestions(task.finalText)
+      const artifact = renderResultArtifact({
+        task,
+        changes,
+        questions,
+        turnResult: task.finalText,
+        verification,
+        autoReview: task.autoReview,
+      })
+      this.store.writeTaskText(task, 'result.md', artifact)
+      this.store.writeTurn(task, task.turnIndex, 'result.md', artifact)
+    } catch (error) {
+      this.store.appendEvent(task, { type: 'result_render_failed', error: truncate(error.message, 500) })
+    }
+    const retainLock = task.executionMayBeActive === true
+    task.endedAt = nowIso()
+    if (!retainLock) task.lockToken = null
+    this.store.saveTask(task)
+    this.store.appendEvent(task, {
+      type: 'turn_end',
+      turn: task.turnIndex,
+      state: task.state,
+      stopReason: task.stopReason,
+      reviewMode: task.reviewMode,
+      autoAccepted: task.review?.mode === 'auto',
+      executionMayBeActive: task.executionMayBeActive === true,
+      backend: 'host',
+    })
+    if (task.state === 'idle' && task.queue.length === 0) this.enqueueNotification(task, 'settled')
+    if (retainLock) {
+      this.store.appendEvent(task, { type: 'lock_retained', reason: 'host execution may still be active; refusing a second writer' })
+    } else {
+      try { if (lockToken) this.store.releaseLock(lockToken) } catch { /* reclaimable */ }
+    }
+    if (task.state === 'failed' || task.state === 'interrupted') {
+      if (task.queue?.length > 0) {
+        this.store.appendEvent(task, { type: 'queue_retained', count: task.queue.length, reason: 'abnormal host turn; queued writes wait for Astra' })
+      }
+    }
+  }
+
   // -------------------------------------------------------------- dispatch
 
   /**
@@ -710,21 +1010,40 @@ export class TaskRunner {
     task.runner.startedAt = nowIso()
     this.store.saveTask(task)
 
-    try {
-      // Create the session before returning so the planner gets a usable id.
-      await this.sessionFor(task)
-      this.markRequestState(task, 'in_progress')
-    } catch (error) {
-      task.state = 'failed'
-      task.error = `could not open a DSH session: ${error.message}`
-      this.store.appendEvent(task, { type: 'dispatch_failed', message: task.error })
-      this.store.releaseLock(lock.token)
-      this.store.saveTask(task)
-      throw error
+    const selected = await this.selectExecutionBackend()
+    task.executionBackend = selected.backend
+    task.live = selected.backend === 'host'
+    if (selected.backend === 'host') {
+      task.guiStatus = 'host-native'
+      task.hostVersion = selected.health?.version ?? null
+      task.hostPid = selected.health?.pid ?? null
     }
+    this.store.saveTask(task)
 
     const prompt = renderExecutionPrompt({ task, packet })
-    await this.startTurn(task, prompt, { lockToken: lock.token, userMessage: null })
+    if (selected.backend === 'host') {
+      try {
+        await this.startHostTurn(task, prompt, { lockToken: lock.token, userMessage: null })
+        this.markRequestState(task, 'in_progress')
+      } catch (error) {
+        // startHostTurn already persisted the failure and released the lock.
+        throw error
+      }
+    } else {
+      try {
+        // Create the session before returning so the planner gets a usable id.
+        await this.sessionFor(task)
+        this.markRequestState(task, 'in_progress')
+      } catch (error) {
+        task.state = 'failed'
+        task.error = `could not open a DSH session: ${error.message}`
+        this.store.appendEvent(task, { type: 'dispatch_failed', message: task.error })
+        this.store.releaseLock(lock.token)
+        this.store.saveTask(task)
+        throw error
+      }
+      await this.startTurn(task, prompt, { lockToken: lock.token, userMessage: null })
+    }
 
     const monitor = this.watchdogs.status(task.id)
     const notification = this.outbox.summarize(task.id)
@@ -741,12 +1060,14 @@ export class TaskRunner {
       implementationPlan: truncate(task.implementationPlan ?? '', 6000),
       state: task.state,
       sessionId: task.sessionId,
+      executionBackend: task.executionBackend ?? 'acp',
+      live: task.live === true,
       guiPolicy: task.guiPolicy ?? DEFAULT_GUI_POLICY,
       monitor,
       notification,
       degraded,
       taskFile: join(this.store.taskDir(task.id), 'task.md'),
-      message: `DSH task ${task.id} started. The bridge will notify this Codex thread when it settles; use dsh_status only for diagnostics.${degraded.length ? ` DEGRADED: ${degraded.join('; ')}` : ''}`,
+      message: `DSH task ${task.id} started on ${task.executionBackend ?? 'acp'}${task.live ? ' (native live GUI session)' : ''}. The bridge will notify this Codex thread when it settles; use dsh_status only for diagnostics.${degraded.length ? ` DEGRADED: ${degraded.join('; ')}` : ''}`,
     }
   }
 
@@ -1435,7 +1756,12 @@ export class TaskRunner {
           { code: 'CANCEL_UNCONFIRMED', details: { taskId } },
         )
       }
-      this.client?.cancel(task.sessionId)
+      if (task.executionBackend === 'host') {
+        try { await this.host.request('cancel', { sessionId: task.sessionId }, { timeoutMs: 10_000 }) } catch { /* abort still stops follow */ }
+        entry.controller?.abort()
+      } else {
+        this.client?.cancel(task.sessionId)
+      }
       await Promise.race([entry.promise, sleep(this.config.cancelGraceMs)])
       if (this.active.has(taskId)) {
         const blocked = this.store.updateTask(taskId, (fresh) => {
@@ -1542,10 +1868,12 @@ export class TaskRunner {
       return fresh
     })
     const packet = readText(join(this.store.taskDir(locked.id), 'task.md'), '')
-    await this.startTurn(locked, renderExecutionPrompt({ task: locked, packet, message: record.text }), {
-      lockToken: lock.token,
-      userMessage: record.text,
-    })
+    const prompt = renderExecutionPrompt({ task: locked, packet, message: record.text })
+    if (locked.executionBackend === 'host') {
+      await this.startHostTurn(locked, prompt, { lockToken: lock.token, userMessage: record.text, create: false })
+    } else {
+      await this.startTurn(locked, prompt, { lockToken: lock.token, userMessage: record.text })
+    }
   }
 
   /** Late ACP confirmation resolves a previously unconfirmed user cancel. */
@@ -1581,6 +1909,17 @@ export class TaskRunner {
         // Another bridge/runner owns the turn (or ownership cannot be proven).
         // Do not pretend it stopped or release its lock.
         settled = false
+      } else if (task.executionBackend === 'host') {
+        this.cancelling.add(taskId)
+        try {
+          await this.host.request('cancel', { sessionId: task.sessionId }, { timeoutMs: 10_000 })
+        } catch (error) {
+          this.store.appendEvent(task, { type: 'host_cancel_failed', error: truncate(error?.message ?? String(error), 500) })
+        }
+        active.controller.abort()
+        await Promise.race([active.promise, sleep(this.config.cancelGraceMs)])
+        settled = !this.active.has(taskId)
+        if (settled) this.cancelling.delete(taskId)
       } else {
         this.cancelling.add(taskId)
         this.client?.cancel(task.sessionId)
@@ -1815,6 +2154,11 @@ export class TaskRunner {
       awaitingAstra: AWAITING.has(task.state),
       turn: task.turnIndex,
       sessionId: task.sessionId,
+      executionBackend: task.executionBackend ?? 'acp',
+      live: task.live === true,
+      hostSessionId: task.hostSessionId ?? null,
+      hostVersion: task.hostVersion ?? null,
+      hostPid: task.hostPid ?? null,
       model: task.model || this.config.model,
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
@@ -1883,6 +2227,9 @@ export class TaskRunner {
       taskKind: task.taskKind ?? 'implement',
       implementationPlan: truncate(task.implementationPlan ?? '', 6000),
       sessionId: task.sessionId,
+      executionBackend: task.executionBackend ?? 'acp',
+      live: task.live === true,
+      hostVersion: task.hostVersion ?? null,
       guiPolicy: task.guiPolicy ?? DEFAULT_GUI_POLICY,
       guiStatus: gui.status,
       guiStatusDetail: gui.detail ?? null,

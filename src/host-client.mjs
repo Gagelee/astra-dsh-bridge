@@ -94,7 +94,7 @@ export class HostControlClient {
       let message
       try { message = JSON.parse(line) } catch { return }
       if (message?.id !== id) return
-      if (message.event === 'frame') queue.push(message.frame)
+      if (message.event === 'frame') { queue.push(message.frame); notify() }
       else if (message.event === 'end') { ended = true; notify() }
       else if (message.event === 'error') { failure = new HostControlError(message.error?.message ?? 'host follow failed', { code: message.error?.code ?? 'HOST_CONTROL_ERROR' }); ended = true; notify() }
     })
