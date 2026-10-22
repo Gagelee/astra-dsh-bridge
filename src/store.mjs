@@ -102,8 +102,12 @@ function snapshotTree(root, limit = 20_000) {
 
 /** The workspace boundary and all durable task-board operations. */
 export class WorkspaceStore {
-  /** @param {string} workspace absolute project directory */
-  constructor(workspace) {
+  /**
+   * @param {string} workspace absolute project directory
+   * @param {{controlOnly?: boolean}} [options] controlOnly skips git exclude
+   *   bookkeeping so a watchdog sidecar cannot touch business-adjacent files.
+   */
+  constructor(workspace, { controlOnly = false } = {}) {
     this.workspace = resolveWorkspace(workspace)
     this.root = join(this.workspace, '.astra-dsh')
     this.dirs = {
@@ -112,9 +116,10 @@ export class WorkspaceStore {
       tasks: join(this.root, 'tasks'),
       locks: join(this.root, 'locks'),
       logs: join(this.root, 'logs'),
+      notifications: join(this.root, 'notifications'),
     }
     for (const dir of Object.values(this.dirs)) ensureDir(dir)
-    this.ensureGitExclude()
+    if (!controlOnly) this.ensureGitExclude()
   }
 
   /** Keep bridge control files out of `git status` without touching tracked .gitignore. */
@@ -148,7 +153,7 @@ export class WorkspaceStore {
   }
 
   /** Create a task record and its human-readable packet. */
-  createTask({ title, packet, requestId, writeScopes, model, effort, runner, reviewMode, verifyCommands, taskKind, implementationPlan, codexThreadId }) {
+  createTask({ title, packet, requestId, writeScopes, model, effort, runner, reviewMode, verifyCommands, taskKind, implementationPlan, codexThreadId, guiPolicy, guiWorkspaceTitle }) {
     const id = timestampId('T')
     const createdAt = nowIso()
     const task = {
@@ -174,8 +179,14 @@ export class WorkspaceStore {
       verification: null,
       autoReview: null,
       sessionId: null,
+      guiPolicy: guiPolicy ?? 'existing',
+      guiWorkspaceTitle: guiWorkspaceTitle ?? null,
+      attachGeneration: 0,
+      attachSessionId: null,
+      attachQueuedAt: null,
       turnIndex: 0,
       queue: [],
+      queueRevision: 0,
       lastAssistantText: '',
       finalText: '',
       stopReason: null,
@@ -202,10 +213,153 @@ export class WorkspaceStore {
     return task
   }
 
+  /**
+   * Persist a task snapshot without letting an older turn/notification replay
+   * overwrite newer durable state. Queue mutations carry an explicit revision,
+   * and a completed review is never rolled back by a stale snapshot.
+   */
   saveTask(task) {
+    const file = join(this.taskDir(task.id), 'task.json')
+    const disk = readJson(file, null)
+    if (disk) {
+      const diskTurn = Number(disk.turnIndex ?? 0)
+      const taskTurn = Number(task.turnIndex ?? 0)
+      if (diskTurn > taskTurn) {
+        // This caller is replaying an older turn. Its notification bookkeeping
+        // lives in the outbox, so dropping the whole stale snapshot is safe.
+        return disk
+      }
+      const diskRevision = Number(disk.queueRevision ?? 0)
+      const taskRevision = Number(task.queueRevision ?? 0)
+      if (diskRevision > taskRevision) {
+        task.queue = disk.queue ?? []
+        task.queueRevision = diskRevision
+      } else if (task.queueRevision === undefined) {
+        task.queueRevision = 0
+      }
+      const diskReviewAt = disk.review?.at ? Date.parse(disk.review.at) : 0
+      const taskReviewAt = task.review?.at ? Date.parse(task.review.at) : 0
+      if (diskTurn === taskTurn && disk.review && diskReviewAt >= taskReviewAt && ['accepted', 'changes_requested', 'rejected'].includes(disk.state)) {
+        task.review = disk.review
+        task.state = disk.state
+        task.phase = disk.phase
+        task.endedAt = disk.endedAt ?? task.endedAt
+      }
+      if (diskTurn === taskTurn && disk.state === 'cancelled' && ['running', 'created', 'idle'].includes(task.state)) {
+        task.state = 'cancelled'
+        task.phase = 'cancelled'
+        task.stopReason = 'cancelled'
+      }
+      // Heartbeats/progress and the sidecar monitor are written by independent,
+      // fresher paths. Never roll them back with an older turn snapshot.
+      if (String(disk.lastAcpUpdateAt ?? '') > String(task.lastAcpUpdateAt ?? '')) {
+        task.lastAcpUpdateAt = disk.lastAcpUpdateAt
+      }
+      if (String(disk.lastBridgeHeartbeatAt ?? '') > String(task.lastBridgeHeartbeatAt ?? '')) {
+        task.lastBridgeHeartbeatAt = disk.lastBridgeHeartbeatAt
+      }
+      if (disk.lastTool && (!task.lastTool || String(disk.lastTool.at ?? '') > String(task.lastTool.at ?? ''))) {
+        task.lastTool = disk.lastTool
+      }
+      if (disk.monitor !== undefined) task.monitor = disk.monitor
+      if (disk.stall !== undefined && disk.stall !== null) {
+        if (task.stall === undefined || task.stall === null) {
+          task.stall = disk.stall
+        } else if (String(disk.stall.suspectedAt ?? '') > String(task.stall.suspectedAt ?? '')) {
+          task.stall = disk.stall
+        } else if (String(disk.stall.suspectedAt ?? '') === String(task.stall.suspectedAt ?? '')) {
+          // Same episode: keep a recovery marker written by the live turn and
+          // take any additional durable fields from disk.
+          task.stall = { ...disk.stall, ...task.stall }
+        }
+      }
+      if (disk.runner && task.runner) {
+        task.runner = {
+          ...disk.runner,
+          ...task.runner,
+          lastHeartbeatAt: String(disk.runner.lastHeartbeatAt ?? '') > String(task.runner.lastHeartbeatAt ?? '')
+            ? disk.runner.lastHeartbeatAt
+            : task.runner.lastHeartbeatAt,
+          turn: Math.max(Number(disk.runner.turn ?? 0), Number(task.runner.turn ?? 0)),
+        }
+      }
+      if (disk.incident && !task.incident && Number(disk.incident.turn ?? 0) >= taskTurn) {
+        task.incident = disk.incident
+      }
+      // A stale snapshot must not clear a real risk, but an explicit resolution
+      // for the same turn (newer than the incident) must not be resurrected by
+      // an older snapshot either.
+      const latestIncidentAt = String(disk.incident?.at ?? '') > String(task.incident?.at ?? '')
+        ? String(disk.incident?.at ?? '')
+        : String(task.incident?.at ?? '')
+      const diskResolved = Boolean(
+        disk.executionMayBeActiveResolvedAt
+        && Number(disk.executionMayBeActiveResolvedTurn ?? -1) === diskTurn
+        && String(disk.executionMayBeActiveResolvedAt) >= latestIncidentAt
+      )
+      const taskResolved = Boolean(
+        task.executionMayBeActiveResolvedAt
+        && Number(task.executionMayBeActiveResolvedTurn ?? -1) === diskTurn
+        && String(task.executionMayBeActiveResolvedAt) >= latestIncidentAt
+      )
+      if (diskResolved) {
+        task.executionMayBeActive = false
+        task.executionMayBeActiveResolvedAt = disk.executionMayBeActiveResolvedAt
+        task.executionMayBeActiveResolvedTurn = disk.executionMayBeActiveResolvedTurn
+        if (disk.incident
+          && Number(disk.incident.turn ?? 0) >= taskTurn
+          && String(disk.incident.at ?? '') >= String(task.incident?.at ?? '')) {
+          task.incident = disk.incident
+        }
+      } else if (disk.executionMayBeActive && !taskResolved) {
+        task.executionMayBeActive = true
+      } else if (task.executionMayBeActive && !disk.executionMayBeActive) {
+        task.executionMayBeActive = true
+      }
+    }
     task.updatedAt = nowIso()
-    writeJson(join(this.taskDir(task.id), 'task.json'), task)
+    writeJson(file, task)
     return task
+  }
+
+  /** Read-modify-write against the latest durable snapshot (safe for heartbeats). */
+  updateTask(id, mutate) {
+    const task = this.loadTask(id)
+    const next = (typeof mutate === 'function' ? mutate(task) : mutate) ?? task
+    return this.saveTask(next)
+  }
+
+  /** Persist the latest human-readable incident for a task. */
+  writeIncident(task, incident) {
+    ensureDir(this.taskDir(task.id))
+    const record = { schema: STORE_VERSION, taskId: task.id, at: nowIso(), ...incident }
+    writeJson(join(this.taskDir(task.id), 'incident.json'), record)
+    task.incident = record
+    return record
+  }
+
+  /** Read the latest incident, including a sidecar-written control-loss file. */
+  readIncident(taskId) {
+    const main = readJson(join(this.taskDir(taskId), 'incident.json'), null)
+    const controlLost = readJson(join(this.taskDir(taskId), 'incident-control-lost.json'), null)
+    if (!main) return controlLost
+    if (!controlLost) return main
+    return String(controlLost.at ?? '') > String(main.at ?? '') ? controlLost : main
+  }
+
+  /** Explicitly mark the latest incident resolved after out-of-band verification. */
+  resolveIncident(taskId, { resolvedBy = 'astra', note = '' } = {}) {
+    const incident = this.readIncident(taskId)
+    if (!incident) return null
+    const resolved = {
+      ...incident,
+      executionMayBeActive: false,
+      resolvedAt: nowIso(),
+      resolvedBy,
+      resolutionNote: truncate(note, 1000),
+    }
+    writeJson(join(this.taskDir(taskId), 'incident.json'), resolved)
+    return resolved
   }
 
   listTasks({ state } = {}) {
@@ -318,22 +472,177 @@ export class WorkspaceStore {
   }
 
   /** Read the current writer lock, or null. */
-  inspectLock() {
+  inspectLock({ includeExecutionRisk = true } = {}) {
     const owner = readJson(join(this.lockDir(), 'owner.json'))
     if (!owner) return null
     const expired = Date.parse(owner.expiresAt ?? 0) < Date.now()
     const dead = owner.pid !== undefined && !isPidAlive(owner.pid)
-    return { ...owner, expired, dead, stale: expired || dead }
+    let blockedByExecutionRisk = null
+    if (includeExecutionRisk) blockedByExecutionRisk = this.executionRiskSummary()
+    return {
+      ...owner,
+      expired,
+      dead,
+      stale: expired || dead,
+      reclaimable: (expired || dead) && !blockedByExecutionRisk,
+      blockedByExecutionRisk,
+    }
+  }
+
+  /**
+   * Scan only this workspace for tasks that may still be executing. This is the
+   * gate used by every writer entry point (Astra lock, dispatch, queued turn).
+   * A dead lock owner or an expired lease is NOT proof that the ACP child died.
+   *
+   * Rules:
+   * - task.executionMayBeActive or a same-turn incident with
+   *   executionMayBeActive !== false is a risk;
+   * - a task/incident resolution only counts for the same turn and only when
+   *   it is at least as new as the incident it resolves;
+   * - an incident from an older turn never blocks a new turn/task;
+   * - unreadable task/incident records fail closed with EXECUTION_RISK_UNKNOWN.
+   */
+  executionRisks() {
+    const risks = []
+    let taskIds
+    try {
+      taskIds = readdirSync(this.dirs.tasks, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+    } catch (error) {
+      if (error?.code === 'ENOENT') return risks
+      throw new BridgeError(`cannot list tasks to evaluate execution risk: ${error.message}`, {
+        code: 'EXECUTION_RISK_UNKNOWN',
+        details: { error: error.message },
+      })
+    }
+    for (const id of taskIds) {
+      let task
+      let incident
+      try {
+        task = readJson(join(this.dirs.tasks, id, 'task.json'), null)
+      } catch (error) {
+        throw new BridgeError(`cannot evaluate execution risk for ${id}: ${error.message}`, {
+          code: 'EXECUTION_RISK_UNKNOWN',
+          details: { taskId: id, error: error.message },
+        })
+      }
+      if (!task) continue
+      try {
+        incident = this.readIncident(id)
+      } catch (error) {
+        throw new BridgeError(`cannot read the execution-risk incident for ${id}: ${error.message}`, {
+          code: 'EXECUTION_RISK_UNKNOWN',
+          details: { taskId: id, error: error.message },
+        })
+      }
+
+      const turn = Number(task.turnIndex ?? 0)
+      const rawIncidentTurn = Number(incident?.turn)
+      // A missing turn on an explicit active incident is treated as the current
+      // turn (fail closed) rather than silently ignored.
+      const incidentTurn = Number.isInteger(rawIncidentTurn)
+        ? rawIncidentTurn
+        : (incident?.executionMayBeActive === true ? turn : -1)
+      const incidentApplies = Boolean(
+        incident
+        && incidentTurn >= turn
+        && incident.executionMayBeActive !== false
+      )
+      const taskActive = task.executionMayBeActive === true
+      if (!taskActive && !incidentApplies) continue
+
+      const latestIncidentAt = incidentApplies ? String(incident.at ?? '') : ''
+      const resolvedAt = task.executionMayBeActiveResolvedAt
+      const resolvedTurn = Number(task.executionMayBeActiveResolvedTurn ?? -1)
+      const taskResolved = Boolean(
+        resolvedAt
+        && resolvedTurn === turn
+        && String(resolvedAt) >= latestIncidentAt
+      )
+      const incidentResolved = Boolean(
+        incident
+        && incident.resolvedAt
+        && incident.executionMayBeActive === false
+        && String(incident.resolvedAt) >= String(incident.at ?? '')
+      )
+      if (taskResolved || incidentResolved) continue
+
+      risks.push({
+        taskId: id,
+        state: task.state ?? null,
+        turn,
+        sessionId: task.sessionId ?? null,
+        phase: task.phase ?? null,
+        incidentKind: incident?.kind ?? null,
+        incidentAt: incident?.at ?? null,
+        ownerPid: task.runner?.pid ?? null,
+        acpPid: task.runner?.acpPid ?? null,
+        executionMayBeActive: true,
+        resolutionHint: 'Verify the old DSH/ACP process is stopped, then use dsh_message force=true for this task. Do not delete or steal the lock.',
+      })
+    }
+    return risks
+  }
+
+  /** First risk (or unknown-risk marker) for status; never throws. */
+  executionRiskSummary() {
+    try {
+      return this.executionRisks()[0] ?? null
+    } catch (error) {
+      return {
+        unknown: true,
+        code: error?.code ?? 'EXECUTION_RISK_UNKNOWN',
+        error: error?.message ?? String(error),
+        executionMayBeActive: true,
+      }
+    }
+  }
+
+  /** Throw the stable writer-gate error if this workspace has any risk task. */
+  assertNoExecutionRisk() {
+    const risks = this.executionRisks()
+    if (risks.length > 0) throw this.executionRiskError(risks)
+    return null
+  }
+
+  executionRiskError(risks) {
+    const risk = risks[0]
+    return new BridgeError(
+      `workspace has unresolved execution risk for ${risk.taskId} (${risk.state ?? 'unknown'}, turn ${risk.turn}); refusing a new writer even if the lock is stale or missing`,
+      {
+        code: 'EXECUTION_MAY_BE_ACTIVE',
+        details: {
+          blockedByExecutionRisk: risk,
+          risks: risks.slice(0, 10),
+          resolution: risk.resolutionHint,
+        },
+      },
+    )
   }
 
   /** Acquire the single-writer workspace lock. Throws LOCK_HELD when someone else owns it. */
   acquireLock({ owner, taskId = null, ttlMs = 2 * 60 * 60 * 1000, note = '' }) {
-    ensureDir(this.dirs.locks)
     const dir = this.lockDir()
+    // Gate every writer entry point before touching a stale/missing lock.
+    let risks = this.executionRisks()
+    if (risks.length > 0) throw this.executionRiskError(risks)
+    ensureDir(this.dirs.locks)
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
         // mkdir is atomic, so exactly one process can create the lock directory.
         mkdirSync(dir)
+        // Close the race with an incident written after the pre-check.
+        try {
+          risks = this.executionRisks()
+        } catch (error) {
+          removePath(dir)
+          throw error
+        }
+        if (risks.length > 0) {
+          removePath(dir)
+          throw this.executionRiskError(risks)
+        }
         const record = {
           owner,
           taskId,
@@ -348,7 +657,11 @@ export class WorkspaceStore {
         return record
       } catch (error) {
         if (!error || error.code !== 'EEXIST') throw error
-        const current = this.inspectLock()
+        // A risk may have appeared after the pre-check; re-check before even
+        // inspecting/reclaiming a stale lock.
+        const risksNow = this.executionRisks()
+        if (risksNow.length > 0) throw this.executionRiskError(risksNow)
+        const current = this.inspectLock({ includeExecutionRisk: false })
         if (!current) continue
         if (!current.stale) {
           throw new BridgeError(
@@ -381,7 +694,7 @@ export class WorkspaceStore {
   }
 
   releaseLock(token) {
-    const current = this.inspectLock()
+    const current = this.inspectLock({ includeExecutionRisk: false })
     if (!current) return false
     if (token !== undefined && current.token !== token) {
       throw new BridgeError('lock token does not match the current owner', { code: 'LOCK_NOT_OWNER' })
@@ -391,7 +704,7 @@ export class WorkspaceStore {
   }
 
   heartbeatLock(token, ttlMs = 2 * 60 * 60 * 1000) {
-    const current = this.inspectLock()
+    const current = this.inspectLock({ includeExecutionRisk: false })
     if (!current) return null
     if (token !== undefined && current.token !== token) return null
     const record = {
@@ -500,6 +813,11 @@ export class WorkspaceStore {
     const d = new Date()
     const pad = (n) => String(n).padStart(2, '0')
     return join(this.dirs.logs, `${prefix}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}.log`)
+  }
+
+  /** Append one diagnostic JSON line without touching task state. */
+  appendJsonLog(prefix, record) {
+    appendJsonLine(this.logFileName(prefix), { t: nowIso(), ...record })
   }
 }
 

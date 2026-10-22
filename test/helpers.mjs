@@ -5,12 +5,14 @@ import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 import { mkdtemp } from 'node:fs/promises'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 export const MOCK_ACP = fileURLToPath(new URL('./fixtures/mock-acp-agent.mjs', import.meta.url))
 export const SERVER = fileURLToPath(new URL('../src/mcp-server.mjs', import.meta.url))
 export const MOCK_CODEX = fileURLToPath(new URL('./fixtures/mock-codex.mjs', import.meta.url))
 export const MOCK_CODEX_OUT = (workspace) => `${workspace}.mock-codex-calls.jsonl`
+export const MOCK_ACP_FAULTS = fileURLToPath(new URL('./fixtures/mock-acp-faults.mjs', import.meta.url))
 
 export async function makeWorkspace(prefix = 'astra-dsh-test-') {
   return mkdtemp(join(tmpdir(), prefix))
@@ -79,6 +81,13 @@ export function startMcp({ cwd, env = {} } = {}) {
     }
   }
 
+  async function kill(signal = 'SIGKILL') {
+    if (child.exitCode !== null || child.signalCode !== null) return
+    const exited = new Promise((resolve) => child.once('exit', resolve))
+    try { child.kill(signal) } catch { /* already gone */ }
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 5000))])
+  }
+
   async function close() {
     child.stdin.end()
     await new Promise((resolve) => {
@@ -97,5 +106,46 @@ export function startMcp({ cwd, env = {} } = {}) {
     return call(name, args, timeoutMs, meta)
   }
 
-  return { child, request, call, callWithMeta, close, stderr, notifications }
+  return { child, request, call, callWithMeta, close, kill, stderr, notifications }
+}
+
+/** Poll until predicate returns truthy, then return its value. */
+export async function waitFor(predicate, { timeoutMs = 10_000, intervalMs = 50, label = 'condition' } = {}) {
+  const deadline = Date.now() + timeoutMs
+  let lastError = null
+  while (Date.now() < deadline) {
+    try {
+      const value = await predicate()
+      if (value) return value
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
+  throw new Error(`timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ''}`)
+}
+
+/** Read successful mock codex calls (all calls unless onlyOk=false). */
+export function readMockCodexCalls(workspace, { onlyOk = false } = {}) {
+  const file = MOCK_CODEX_OUT(workspace)
+  if (!existsSync(file)) return []
+  const calls = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  return onlyOk ? calls.filter((call) => !call.fail) : calls
+}
+
+export function readTaskRecord(workspace, taskId) {
+  return JSON.parse(readFileSync(join(workspace, '.astra-dsh', 'tasks', taskId, 'task.json'), 'utf8'))
+}
+
+export function readTaskFile(workspace, taskId, name) {
+  const file = join(workspace, '.astra-dsh', 'tasks', taskId, name)
+  return existsSync(file) ? readFileSync(file, 'utf8') : null
+}
+
+export function readNotifications(workspace) {
+  const dir = join(workspace, '.astra-dsh', 'notifications')
+  if (!existsSync(dir)) return []
+  return readdirSync(dir)
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => JSON.parse(readFileSync(join(dir, name), 'utf8')))
 }

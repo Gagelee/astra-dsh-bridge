@@ -50,7 +50,7 @@ async function handleRequest(message) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: 'astra-dsh-bridge', version: VERSION },
         instructions:
-          'Astra plans; DSH executes. Start with astra_inbox, dispatch complete packets with dsh_dispatch, block with dsh_wait, review with dsh_result, and record dsh_review.',
+          'Astra plans; DSH executes. Start with astra_inbox, dispatch complete packets with dsh_dispatch, and review with dsh_result/dsh_review. When a task settles the bridge wakes this same Codex thread via codex queue; dsh_wait is diagnostic only.',
       })
       return
     }
@@ -63,11 +63,11 @@ async function handleRequest(message) {
     case 'tools/call': {
       const name = params?.name
       const args = params?.arguments ?? {}
-      bridge.codexCallMeta = params?._meta ?? null
+      const meta = params?._meta ?? null
       const controller = new AbortController()
       inflight.set(id, controller)
       try {
-        const result = await callTool(name, args, bridge, { signal: controller.signal })
+        const result = await callTool(name, args, bridge, { signal: controller.signal, meta })
         const content = [{ type: 'text', text: String(result.text ?? '') }]
         const payload = { content, isError: Boolean(result.isError) }
         if (result.structured !== undefined) payload.structuredContent = result.structured
@@ -152,8 +152,15 @@ async function shutdown(code) {
 
 process.on('SIGTERM', () => { void shutdown(0) })
 process.on('SIGINT', () => { void shutdown(0) })
+process.stdout.on('error', (error) => {
+  // Codex closed its control pipe. A turn in flight must be reported by the
+  // watchdog sidecar rather than leaving an orphaned MCP process behind.
+  log('stdout error:', error?.message ?? error)
+  void shutdown(1)
+})
 process.on('uncaughtException', (error) => {
   log('uncaught exception:', error?.stack ?? error)
+  void shutdown(1)
 })
 process.on('unhandledRejection', (error) => {
   log('unhandled rejection:', error?.stack ?? error)

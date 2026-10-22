@@ -59,9 +59,11 @@ EOF
 │   ├── changes.json      # 变更文件与 diff
 │   ├── verification.json # 桥独立执行的验收命令结果
 │   ├── review.md         # Astra 或自动验收的结论
+│   ├── incident.json     # 最近一次失败/中断的可读证据（部分输出、退出码、stderr 摘要）
 │   └── turns/<NNN>/      # 每回合的 prompt / result
+├── notifications/        # 持久通知 outbox（每任务/回合/事件一条记录 + 原子 claim）
 ├── locks/workspace.lock/ # 单写者锁
-└── logs/                 # ACP stderr 与诊断日志
+└── logs/                 # ACP stderr、bridge 与 watchdog sidecar 诊断日志
 ```
 
 `git` 仓库会把 `.astra-dsh/` 追加到 `.git/info/exclude`，不会污染 `git status`，也不会改受版本控制的 `.gitignore`。
@@ -89,6 +91,8 @@ EOF
 | `writeScopes` | 预计会改的路径；`auto` 验收时也用于检查改动是否越界 |
 | `reviewMode` | `auto` / `light` / `full`，默认 `light` |
 | `verifyCommands` | 桥在每回合后独立执行的验收命令（最多 5 条，每条 120s） |
+| `guiPolicy` | GUI 归组策略：`existing`（默认，只复用同路径已注册工作区）、`create`（允许 GUI 插件创建）、`off`（不投递 GUI） |
+| `guiWorkspaceTitle` | 仅当 `guiPolicy=create` 实际新建工作区时使用的显示标题 |
 | `model` / `reasoningEffort` | 本次任务使用的 DSH 模型与推理档位 |
 
 任务包原样落盘为 `task.md`，并注入 DSH 的第一条 prompt。**Astra 负责分析、方向、优先级和计划；DSH 负责按计划修改。** DSH 可以在实现中进一步分析代码和边界，但交付物是改动和验证结果，不是产品分析/路线图。
@@ -115,7 +119,11 @@ EOF
 |---|---|---|---|
 | `auto` | 桥自动 | 回合后跑 `verifyCommands`；全部通过、无问题、无排队指令、改动都在 `writeScopes` 内，才自动 `accepted` 并把父需求置 `done` | 确定性高、低风险、验证命令可靠的机械任务 |
 | `light` | Astra | 跑 `verifyCommands` 并把结果放进状态/结果；不自动签收 | 低风险、Astra 看 diff/文件即可 |
-| `full` | Astra | 同 `light`，但按完整验收流程人工审阅 | 高风险、跨模块、需求有歧义 |
+| `full` | Astra | 同 `light`，Astra 补独立证据并做 targeted 复跑 | 高风险、跨模块、需求有歧义、并发/生命周期 |
+
+`reviewMode` 是 Astra 对“证据是否足够”的判断，不是按任务类型查表。判断维度：影响面、可逆性、可观测性、不确定性、并发/生命周期、环境依赖。选择理由应写进 task 的 `context`/`notes`。
+
+独立复跑只在以下情况需要：任务改了测试/夹具、结果不一致或 flaky、改动涉及并发/锁/进程生命周期/崩溃恢复、或现有证据覆盖不了验收标准。否则 `light` 直接用桥的 verification + diff + 关键文件，不重跑 DSH 已跑过的全量套件；`full` 也优先“变更相关测试 + 一个 smoke”，只有明确的 flaky 假设才重复全量。
 
 `auto` 的硬性条件：
 
@@ -130,31 +138,17 @@ EOF
 
 ### 4.1 交接前的评估
 
-默认 `light`，不要每个任务都 `full`。Astra 在派发前先判断：
+`reviewMode` 由 Astra 判断，但判断必须有固定标准：选择**成本最低但证据充分**的档位。
 
-**必须 Astra 亲自验收（`full`）**
+风险维度：影响面（单文件 vs 公共 API/跨模块）、可逆性（代码 vs 数据/权限/删除）、可观测性（确定性测试 vs 主观交互）、不确定性（需求是否清楚）、并发/生命周期（锁、进程退出、通知重试、长任务）、环境依赖（本地 vs 真实 GUI/外部服务）。
 
-- 认证、权限、密钥、安全边界
-- 数据迁移、删除、不可逆操作
-- 公共 API、跨模块契约、架构调整
-- 用户可见的交互、设计、文案
-- 没有可靠自动化验证，或需求本身有歧义
-- 改动跨服务、跨仓库，或预计越出 `writeScopes`
+证据标准：
 
-**可以交给 DSH/桥（`auto`）**
+- `auto`：机械、边界封闭，验证命令通过等价于验收，没有需要人判断的语义
+- `light`：局部、可逆、diff 可读，现有测试/`verifyCommands` 能捕获失败；Astra 看真实 diff + 关键文件 + verification，不重跑全量
+- `full`：高风险维度命中，或 `light` 证据不足；Astra 补独立证据，但仍以 targeted 测试 + smoke 为主
 
-- 格式化、注释、文档
-- 局部 bug fix，且已有测试覆盖
-- 机械替换、生成代码、重命名
-- 配置/脚本改动，且能用命令验证
-- 只改测试
-
-**默认 `light`**
-
-- 局部、低风险、diff 可读，验收标准能用文件/diff 核对
-- 桥跑 `verifyCommands`，Astra 只看 diff + 关键文件，不重跑全量测试
-
-如果任务一开始判断为 `light`，执行中发现命中风险清单（改动越界、测试失败、DSH 提问、跨模块），再升级到 `full`。
+升级：`light` 中出现验证失败、flaky、越界改动、需求实质疑问，升级 `full`；不要为了省 token 压回 `light`。在 `context`/`notes` 写选择理由。
 
 ### 4.2 触发式完成（不再轮询）
 
@@ -167,8 +161,57 @@ codex queue --thread <threadId> --message "DSH task T-... settled; call dsh_resu
 
 - 这会开启**一轮新的 Astra**，但仍在原 thread / 原 session，不新建会话。
 - 多个任务同时 settle 会合并成一条消息；`auto` 已签收、`cancelled` 的任务不触发。
-- `dsh_wait` 保留为诊断/兜底；如果它正在等，桥会抑制完成通知，避免双唤醒。
+- `dsh_wait` 保留为诊断/兜底；如果它正在等，桥会抑制**正常完成**通知，避免双唤醒；失败/中断/控制连接丢失等异常通知永不被它吞掉。
 - 桥仍会在回合结束后本地执行 `verifyCommands`，不消耗模型 token。
+- 通知不再只存在内存里：每条事件写入 `.astra-dsh/notifications/<id>.json`，失败按指数退避重试，桥重启后继续未完成的记录。详见 4.4。
+
+### 4.4 故障感知、疑似停滞与安全边界
+
+**ACP 传输故障（可感知）**
+
+- 桥同时监听 ACP 子进程 `exit`、stdout 断流、stdin `EPIPE`/错误和不可恢复的协议流。任一故障只 settle 一次：拒绝全部 pending 请求、标记客户端不可用、通知 runner 记录 incident。
+- 传输故障**只终止控制 pending，不自动 SIGTERM/SIGKILL 仍可能执行的 ACP**；只有显式 `dispose`/用户 cancel 的清理路径才按授权语义终止子进程。
+- incident 保留 `errorCode`/`exitCode`/`signal`、最后 stderr 摘要（截断并脱敏）、最后 phase/tool、session/turn 和**已产生的部分 assistant 输出**。部分输出在 `incident.partialText`，任务 `lastAssistantText` 也尽量保留。
+- 故障/失败会先持久化 incident 和通知 outbox，再执行最多 5 条 `verifyCommands`，不需要等验证跑完才告警。
+- 用户 `dsh_cancel` 与正常 `dispose` 是预期路径，不会产生失败告警；只有异常断连才写 incident。
+
+**`executionMayBeActive` 与锁**
+
+- 如果 stdout/stdin 断裂但 ACP 子进程可能仍在跑，或者桥自己消失时 ACP 仍存活，桥会标记 `executionMayBeActive: true`，**保留 workspace 锁**，并拒绝 `dsh_message` 自动 resume / 新写者接管。
+- 该风险在 `WorkspaceStore.acquireLock` 这一全 workspace 写入口生效：`dsh_dispatch`、`astra_lock acquire`、queued turn 都会在 `EXECUTION_MAY_BE_ACTIVE` 处被拒绝，**即使 owner bridge PID 已死、TTL 已过期或锁文件缺失**。只有同 turn 的有效 resolution 才放行；`dsh_status`/`astra_status` 的 `lock.blockedByExecutionRisk`/`executionRisk` 会显示风险任务，stale 与可回收是两回事。
+- 用户 cancel 若在 `ASTRA_DSH_CANCEL_GRACE_MS`（默认 20s）内未获 ACP 确认，不会把 `executionMayBeActive` 置 false 或放锁；`dsh_cancel` 返回 `cancelConfirmed=false / lockRetained=true`，状态显示 `cancel-unconfirmed`。如果 ACP 稍后确认停止，runner 会自动清除风险标记并释放该任务锁。
+- 这种情况下的告警文案是“控制连接丢失，执行可能仍活跃”，不是“任务已停止”。桥不会为了感知故障自动 kill 真实任务。
+- 只有能证明 ACP 进程已退出（或明确是用户确认 cancel）时才释放锁。若 `dsh_status` 显示 `executionMayBeActive`，请先在桥外确认旧 DSH/ACP 进程已停止。确认后可用显式的 `dsh_message force=true` 清除 incident 活跃标记并释放保留锁；该操作会写入 `executionMayBeActiveResolvedAt/ResolvedTurn` 证据，旧 snapshot 不能清除真实风险，也不能复活已确认的恢复。默认（无 `force`）会被拒绝，绝无自动 resume。
+- PID 存活判断遵循：`EPERM`/未知 = 可能存在，绝不据此断言死亡；PID 存活但心跳陈旧也不自动判死（可能复用或挂起）。只有确定死亡，或本 runner 确认自己不再拥有活跃回合时，才进入 interrupted。
+
+**异常回合与队列**
+
+- 失败/中断不会自动执行 `task.queue` 里的后续写操作，队列原样保留给 Astra 决策；正常 `end_turn` 仍按既有语义自动开始下一条排队指令。
+- 任务 `queueRevision` 与 durable outbox 隔离，旧 `task.json` 快照不会覆盖新回合、新 review 或通知状态。
+
+**持久通知 outbox 与真实边界**
+
+- 事件 id 为 `taskId~turn~kind`，同一事件重复触发只保留一条；发送前重新读取最新任务并过滤已 review、已换 turn、已取消、stall 已恢复等失效事件。
+- 只允许 `codex queue --thread <dispatch 时该次 MCP `_meta.threadId`>`；不会新 session、不会用固定会话名、不会取用户 args 或其他 thread。
+- claim 使用原子 `mkdir` 租约 + owner token；runner 与 watchdog sidecar 不能同时发同一事件。事件 payload 写入后不可变，发送状态/attempts/receipt 只能在 claim 内修改；CLI 调用期间按 lease/3 续租，旧 owner 的 release 不会删除新 owner 的 claim。recover 只接管无健康 claim 的记录。成功后写 `receipt`，失败持久化 `attempts`/`lastError`/`nextAttemptAt` 并退避。
+- CLI 没有幂等 key。桥能保证：同一事件在 claim 健康时最多一次发送；但“CLI 已接收、receipt 落盘前进程崩溃”会在租约过期后重试一次，因此真实语义是 **at-least-once**（可能重复），不是 exactly-once。消息里带任务 id/turn，重复投递可识别。lease 续租是协作式的：如果发送进程被 SIGSTOP/整机挂起超过 lease，仍可能出现重复。
+- 缺少 dispatch thread、Codex CLI 或 watchdog 启动失败时，`dsh_dispatch` 和 `astra_status`/`dsh_status` 会显示 `degraded` 及原因，不会静默丢弃。
+
+**桥自身被 SIGKILL / stdio 关闭**
+
+- 每个新回合启动一个小型、独立的 watchdog sidecar（不是 daemon/cron/launchd），通过 IPC 与桥相连。supervisor 必须收到携带 task/turn/runner instance 的 `ready` ACK 才报告 active；初始化失败/超时会收尾并显示 degraded。sidecar 只继承受控 env 子集（桥配置、PATH/HOME/TMPDIR、测试 mock CLI 变量），不隐式继承任意进程环境。正常回合结束/取消时桥发送 `shutdown`，sidecar 退出。
+- 父进程消失（包括 SIGKILL）或 stdio 关闭且回合仍在运行时，sidecar 读取 durable task/runner instance+turn+ACP PID，写一条 `incident-control-lost.json` 和一条 control-lost 通知，向**dispatch 时的原 thread**告警。
+- 父进程已死时没有新的 bridge 驱动 outbox，sidecar 会在 `ASTRA_DSH_WATCHDOG_NOTIFY_BUDGET_MS`/`..._MAX_ATTEMPTS` 预算内只重试**自己的 control-lost 事件**；成功、失效、degraded 或预算耗尽才退出。耗尽时记录保持 `retrying` 并写明“future bridge start will resume”，由下次桥启动恢复。
+- sidecar 不修改 `task.json`、不 resume 模型、不释放未知锁、不碰业务文件；它只读任务、写 incident/outbox 并发送通知。
+- 若配置 `ASTRA_DSH_WATCHDOG=0` 或 sidecar 无法启动，状态会明确显示 disabled/degraded；桥存活时仍有启动/`status` 时的 reconcile 兜底。未修改的老任务不会被自动 retrofit 或重启。
+
+**长时间无进展 ≠ 失败**
+
+- `lastAcpUpdateAt` 记录 ACP 最后一次语义更新；`lastBridgeHeartbeatAt` 记录桥自身心跳。两者分开解释“DSH 没输出”和“桥死了”。
+- `ASTRA_DSH_STALL_WARN_MS`（默认 15 分钟，`0` 关闭）每个 quiet episode 发一次 suspected-stall 警告/通知（episode identity 进入通知 id），任务保持 `running`、锁保留，不 auto-cancel、不算 interrupted；长工具会带上当前 tool 和最后活动时间。
+- 新 ACP 活动会清除 episode 并记录 `stall_recovered`，避免持续高频唤醒。`dsh_status` 把这种情况显示为 warning，不显示为 error。
+
+更完整的字段、通知状态机、故障排查和安全升级步骤见 `docs/RESILIENCE.md`。GUI 把外部 ACP 未结束 turn 显示成“任务已停止”的问题不是 ACP 退出证据，分析见 `docs/EXTERNAL_SESSION_GUI.md`。
 
 ### 4.3 需求确认 reviewer（可选，默认关闭）
 
@@ -203,15 +246,15 @@ reviewer 默认关闭。DSH 回合内已经自检，桥也会独立跑 `verifyCo
 
 ## DSH GUI 可见性
 
-Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
+Codex 发起的任务会出现在 DSH GUI 的会话列表里：
 
-- 会话写入 `~/.dsh/sessions/<编码后的工作目录>/<session-id>/`
-- 标题取任务 prompt 的首行，已带任务 ID 和标题
-- 桥在创建 ACP 会话后会把 `{workspace, sessionId}` 写入 `~/.dsh/astra-dsh/attach/`
-- 已安装的 GUI 插件 `@astra-dsh/workspace-attach` 会轮询这个队列，在 GUI 进程内调用 `workspaceRegistry.resolveByPath/create` 和 `workspace.attachSession`
-- 如果该 workspace 还没在 DSH 里注册，插件会先创建它；因此会话会自动归到项目分组下
-- 它是 DSH 执行会话的持久化记录：可以查看 transcript，但**不要在执行中从 GUI 向它发消息**；控制面仍然是 Codex/Astra
-- 如果 GUI 里没出现，检查 `astra_status` 的 `dshHome`/`attachQueueDir` 是否为 `~/.dsh`，以及 Codex 配置里的 `writable_roots`
+- 会话写入 `~/.dsh/sessions/<编码后的工作目录>/<session-id>/`；标题取任务 prompt 的首行，已带任务 ID 和标题。
+- 桥在创建 ACP 会话后把请求写入 `~/.dsh/astra-dsh/attach/<taskId>~<sessionId>~<generation>~<workspaceHash>.json`（不可变 per-identity 命名；`guiPolicy=off` 时不写）。旧 `<taskId>.json` 请求由插件严格校验后按 `existing` 迁移，绝不隐式创建。
+- 已安装的 GUI 插件 `@astra-dsh/workspace-attach` 轮询这个队列，在 GUI 进程内先通过只读的 `sessionController.list()` 确认会话已持久化可见，再 `ctx.emit('api-session/added', summary)` 把外部 ACP 会话发布进客户端会话目录（无需重启 GUI），最后按策略用 `workspaceRegistry.resolveByPath/create` + `workspace.attachSession` 归组。插件自包含（协议实现 `gui-plugin/protocol.js`），每 pump 最多一次共享 `list()`。
+- `existing`（默认）只复用规范化后同路径的已注册工作区，不存在则返回 `unregistered` 跳过、不创建；`create` 才允许创建（title 缺省交给 registry 取目录名）；`off` 完全不发布、不归组。路径经 realpath 规范化防别名重复。
+- 它只是 DSH 执行会话的持久化记录：可以查看 transcript，但**不要在执行中从 GUI 向它发消息**；控制面仍然是 Codex/Astra。
+- 插件成功写持久化 ACK 后删除请求；`astra_status` 显示队列路径、插件健康/版本、每个任务的 `guiStatus`（`queued`/`waiting-session`/`unregistered`/`attached`/`off`/`failed`/`private-home`）。ACK 仅证明 host 已发布列表更新，不声称客户端已渲染。
+- GUI 未运行/未注册/策略 off/私有 DSH_HOME fallback 都会给出可诊断状态；可用 `dsh_gui_retry` 受控重投，不影响任务执行。ACCP 进程退出/超时不再触发 home 切换。
 
 ## 用户旅程
 
@@ -246,9 +289,10 @@ Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
 | `astra_request_read` / `astra_request_create` / `astra_request_claim` | 需求的读取、创建、认领与规划 |
 | `astra_lock` | Astra 写锁的 acquire/release/status |
 | `dsh_dispatch` | 创建实现任务包（Astra 计划）并启动 DSH 回合 |
-| `dsh_list` / `dsh_status` | 任务列表、进度 |
+| `dsh_list` / `dsh_status` | 任务列表、进度、健康/incident/通知与锁状态 |
 | `dsh_wait` | 诊断/兜底等待（正常流程不用） |
-| `dsh_message` / `dsh_cancel` | 追加指令/回答问题/打断/停止 |
+| `dsh_gui_retry` | 受控重投 GUI 会话可见性/归组（不启动或恢复任何 DSH 回合） |
+| `dsh_message` / `dsh_cancel` | 追加指令/回答问题/打断/停止；`force=true` 仅用于确认旧进程已停止后清除可能活跃标记 |
 | `dsh_result` / `dsh_diff` | 结果报告、真实工作区 diff |
 | `dsh_read_file` | 读取真实文件字节与 sha256，用于验收 |
 | `dsh_review` | 记录验收结论（手动/light/full），可选直接发送返工指令 |
@@ -263,7 +307,7 @@ Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
 | `ASTRA_DSH_DSH_BIN` | `~/.local/bin/dsh` 或 PATH 中的 `dsh` | DSH 启动器 |
 | `ASTRA_DSH_DSH_HOME` | `~/.dsh`（安装脚本写入） | DSH home（凭证、会话）；与 DSH GUI 共用，任务会话可在 GUI 中看到。若沙箱拒绝写入，桥回退到 `<workspace>/.astra-dsh/dsh-home` |
 | `ASTRA_DSH_CREDENTIALS` | `~/.dsh/.credentials.yaml` | 凭证源；桥会在 DSH home 里创建只读符号链接 |
-| `ASTRA_DSH_MODEL` | `deepseek-v4-pro` | 默认执行模型 |
+| `ASTRA_DSH_MODEL` | `deepseek-flash` | 默认执行模型 |
 | `ASTRA_DSH_MODEL_PROVIDER` | `deepseek-official` | 模型提供方 |
 | `ASTRA_DSH_EFFORT` | `high` | `off/low/high/max` |
 | `ASTRA_DSH_PERMISSION_MODE` | `workspace-write` | DSH 自身沙箱 |
@@ -273,6 +317,19 @@ Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
 | `ASTRA_DSH_CODEX_BIN` | 自动探测 Codex app CLI | `codex queue` 使用的 CLI 路径 |
 | `ASTRA_DSH_LOCK_TTL_MS` | 2h | DSH 回合锁租期 |
 | `ASTRA_DSH_VERIFY_TIMEOUT_MS` | `120000` | 每条 `verifyCommands` 的超时 |
+| `ASTRA_DSH_STALL_WARN_MS` | `900000`（15 分钟） | 长时间无 ACP 更新的 suspected-stall 警告阈值；`0` 关闭，仅警告不取消 |
+| `ASTRA_DSH_PROGRESS_HEARTBEAT_MS` | `5000` | 桥心跳/停滞检查间隔（测试可注入很短的值） |
+| `ASTRA_DSH_PID_STALE_MS` | `120000` | runner 心跳视为陈旧的时间；陈旧也不单独断言进程死亡 |
+| `ASTRA_DSH_NOTIFY_RETRY_BASE_MS` | `2000` | 通知 CLI 失败的首次退避 |
+| `ASTRA_DSH_NOTIFY_RETRY_MAX_MS` | `300000` | 通知退避上限 |
+| `ASTRA_DSH_NOTIFY_LEASE_MS` | `60000` | 通知 claim 租约；CLI 运行期间自动续租 |
+| `ASTRA_DSH_NOTIFY_CLI_TIMEOUT_MS` | `30000` | `codex queue` 调用超时；与 lease 配合防止执行中被抢 |
+| `ASTRA_DSH_WATCHDOG` | `1` | 每回合独立 watchdog sidecar；`0` 关闭（桥崩溃无独立告警，状态显示 disabled） |
+| `ASTRA_DSH_WATCHDOG_READY_TIMEOUT_MS` | `3000` | 等待 sidecar ready ACK 的上限；超时收尾并 degraded |
+| `ASTRA_DSH_WATCHDOG_NOTIFY_BUDGET_MS` | `300000` | 桥死后 sidecar 重试自己 control-lost 通知的总预算 |
+| `ASTRA_DSH_WATCHDOG_NOTIFY_MAX_ATTEMPTS` | `20` | 桥死后 sidecar 重试次数上限 |
+| `ASTRA_DSH_CANCEL_GRACE_MS` | `20000` | 等待 ACP 确认 cancel 的宽限；超时保留锁并标记 cancel-unconfirmed |
+| `ASTRA_DSH_RECONCILE` | `1` | 启动/注册 workspace 时恢复本 workspace 的异常与待通知记录；不扫描其他项目 |
 
 `ASTRA_DSH_PERMISSION_POLICY=allow` 只决定 ACP 权限请求的自动应答；DSH 的 `workspace-write` 沙箱仍然生效。若本机沙箱后端不可用（例如嵌套沙箱环境），DSH 可能请求升级；此时 `allow` 会让它继续，`reject` 会让它失败关闭。
 
@@ -288,6 +345,12 @@ Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
 
 **会话无法 resume。** ACP 的 resume 要求同一 `DSH_HOME`、同一工作目录、非子会话。桥会自动降级为新建会话，并在 `task.json` 里记录 `sessionRecreated: true`；任务包仍在，不会丢上下文。
 
+**任务卡在 running / 很久没有输出。** 先看 `dsh_status`：`health=suspected-stall` 只是 warning，回合仍在跑、锁仍保留，不要当成失败；`lastTool` 会说明正在执行的工具。若 `executionMayBeActive=true`，说明控制连接曾异常丢失，旧 ACP 可能仍在执行，桥故意不释放锁、拒绝 resume。先在桥外确认旧 DSH/ACP 进程已停止，再处理任务。
+
+**没有收到完成通知。** 看 `dsh_status`/`astra_status` 的 `notification`：`pending`/`retrying` 会显示 attempts、lastError、nextAttemptAt；`degraded` 常见原因是 dispatch 时没有 MCP `_meta.threadId`、找不到 Codex CLI 或 `ASTRA_DSH_NOTIFY_CODEX=0`。通知记录在 `.astra-dsh/notifications/`，桥重启会自动恢复。外部 CLI 无幂等 key，极端崩溃窗口可能重复一次，见 4.4。
+
+**桥被 SIGKILL 后任务还会被通知吗？** 会，只要 watchdog sidecar 正常启动：它会写 `incident-control-lost.json` 并向原 thread 发 control-lost 告警，但不会改任务状态/锁。若 `astra_status` 显示 watchdog disabled/degraded，则没有独立告警，只剩桥存活时的 reconcile。
+
 **Codex 看不到工具。** 确认 `codex mcp list` 中出现 `astra_dsh`，并重启 Codex。`astra_status` 能返回诊断信息。
 
 **Codex 能派发但自己读不了文件。** 如果 Codex 的 shell 被本机 sandbox 拦截，用 `dsh_read_file` 读取真实文件；桥进程与 Codex 同处工作区沙箱，读工作区文件是允许的。
@@ -297,8 +360,10 @@ Codex 发起的任务现在会出现在 DSH GUI 的会话列表里：
 ## 测试
 
 ```bash
-node --test test/*.test.mjs     # 单元 + mock ACP 集成（不消耗模型额度）
+node --test test/*.test.mjs     # 单元 + mock ACP/通知/watchdog 故障注入（不消耗模型额度）
 ASTRA_DSH_DSH_HOME=$HOME/.dsh node scripts/real-e2e.mjs /tmp/some-workspace
 ```
+
+故障注入测试全部使用临时 workspace、临时 DSH home 和 mock ACP/Codex：覆盖 ACP 退出/断 stdout/EPIPE、部分输出保留、用户取消不告警、异常后队列不执行、通知退避与跨重启恢复、失效/重复事件、EPERM、无 thread 降级、watchdog 收尾，以及 SIGKILL/stdio 关闭后的 sidecar 告警。它们不触碰真实的业务任务或 ACP 会话。
 
 真实端到端测试会启动 `dsh acp`、创建一个文件并回传结果。

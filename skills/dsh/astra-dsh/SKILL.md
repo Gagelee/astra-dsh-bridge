@@ -72,16 +72,17 @@ astra-dsh diff   --workspace "$PWD" --since T-...
 | `idle` | 回合结束，等待 Astra 审阅 |
 | `changes_requested` | Astra 要求返工 |
 | `accepted` / `rejected` | Astra 已验收 / 拒绝（`accepted` 可能来自 auto 验证） |
-| `failed` / `interrupted` | 执行失败 / 桥或进程中断；可继续会话 |
+| `failed` / `interrupted` | 执行失败 / 桥或进程中断；检查 `incident` 与 `executionMayBeActive` 后再决定是否继续 |
 | `cancelled` | 被取消，会话保留 |
 
 ## 协作注意
 
 - DSH 回合运行时不要编辑同一批文件；锁在 `astra-dsh status` 里可见。
-- 任务包在 `tasks/<T-id>/task.md`，结果在 `result.md`，真实改动在共享目录；向用户汇报时引用真实文件，不要只复述任务描述。
+- 任务包在 `tasks/<T-id>/task.md`，结果在 `result.md`，异常证据在 `incident.json`，真实改动在共享目录；向用户汇报时引用真实文件，不要只复述任务描述。
+- `executionMayBeActive=true` 表示控制连接丢失时旧 ACP 可能仍在执行；桥会保留锁并拒绝自动 resume，`dsh_dispatch`/`astra_lock acquire` 也会被 `EXECUTION_MAY_BE_ACTIVE` 拒绝，即使锁 owner 已死或 TTL 过期。先在桥外确认旧进程已停止，不要直接继续或启动第二个写者。`cancelConfirmed=false` 同样不能当作已停止。
 - 任务包包含 Astra 的 `implementationPlan`。你的职责是按计划动手修改；可以在实现过程中进一步分析代码和边界条件、提出调整建议，但不要另做产品分析/优先级/路线图。计划有问题就用 `QUESTION:` 问 Astra。
 - 任务包可能包含 `Verification commands`：桥会在回合结束后独立执行这些命令。你仍应先自行验证，但不要修改或删除 `verification.json`，它由桥维护。
 - `accepted` 可能是 Astra 手动签收，也可能是 `auto` 模式在验证命令全部通过后自动签收；不要因此跳过自己回合内的验证。
-- Codex 发起的执行会话会写入共享 `~/.dsh/sessions`，GUI 插件会自动把它挂到对应项目 workspace（不存在时先创建）；GUI 只用于查看，执行中的控制仍由 Codex/Astra 完成。
+- Codex 发起的执行会话会写入共享 `~/.dsh/sessions`，GUI 插件会把外部 ACP 会话发布进 GUI 会话目录并按任务声明的 `guiPolicy` 归组（`existing` 默认只复用已注册工作区，`create` 才创建，`off` 不发布不归组）；GUI 只用于查看，执行中的控制仍由 Codex/Astra 完成。
 - 如果用户问的问题需要 Astra 决策，说明这属于 Astra 的职责，并建议在 Codex 中继续；或把补充信息写成新的 request。
 - 不要删除 `.astra-dsh/`；它同时是 Astra 的审阅依据。

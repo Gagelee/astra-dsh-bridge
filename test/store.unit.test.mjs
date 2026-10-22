@@ -55,6 +55,120 @@ describe('workspace store', () => {
     store.releaseLock(reclaimed.token)
   })
 
+  it('refuses every new writer while a task may still be executing, even with a dead/expired lock', async () => {
+    const workspace = await makeWorkspace()
+    const store = new WorkspaceStore(workspace)
+    const task = store.createTask({ title: 'Risk task', packet: '# risk\n', writeScopes: ['out.txt'] })
+    const lock = store.acquireLock({ owner: 'dsh', taskId: task.id, ttlMs: 60_000 })
+    task.state = 'interrupted'
+    task.turnIndex = 1
+    task.executionMayBeActive = true
+    task.runner = { instance: 'dead-runner', pid: 2_147_483_647, turn: 1, acpPid: process.pid }
+    store.saveTask(task)
+
+    for (const expired of [false, true]) {
+      writeFileSync(join(store.lockDir(), 'owner.json'), JSON.stringify({
+        ...lock,
+        pid: 2_147_483_647,
+        expiresAt: expired ? new Date(Date.now() - 60_000).toISOString() : lock.expiresAt,
+      }))
+      assert.throws(
+        () => store.acquireLock({ owner: 'astra', ttlMs: 60_000 }),
+        (error) => error.code === 'EXECUTION_MAY_BE_ACTIVE'
+          && error.details?.blockedByExecutionRisk?.taskId === task.id
+          && error.details.blockedByExecutionRisk.acpPid === process.pid,
+      )
+      const current = store.inspectLock({ includeExecutionRisk: false })
+      assert.equal(current.token, lock.token, 'risk lock must not be reclaimed')
+    }
+
+    const inspected = store.inspectLock()
+    assert.equal(inspected.dead, true)
+    assert.equal(inspected.reclaimable, false)
+    assert.equal(inspected.blockedByExecutionRisk.taskId, task.id)
+  })
+
+  it('refuses a new writer when the lock is missing but a sidecar-only incident is unresolved', async () => {
+    const workspace = await makeWorkspace()
+    const store = new WorkspaceStore(workspace)
+    const task = store.createTask({ title: 'Sidecar risk', packet: '# sidecar\n', writeScopes: ['out.txt'] })
+    task.state = 'cancelled'
+    task.turnIndex = 1
+    task.executionMayBeActive = false
+    task.runner = { instance: 'dead-runner', pid: 2_147_483_647, turn: 1, acpPid: process.pid }
+    store.saveTask(task)
+    writeFileSync(join(store.taskDir(task.id), 'incident-control-lost.json'), `${JSON.stringify({
+      schema: 1,
+      taskId: task.id,
+      kind: 'control-lost',
+      turn: 1,
+      at: new Date().toISOString(),
+      executionMayBeActive: true,
+      ownerPid: 2_147_483_647,
+      acpPid: process.pid,
+    }, null, 2)}\n`)
+    assert.equal(store.inspectLock(), null)
+    assert.throws(
+      () => store.acquireLock({ owner: 'astra', ttlMs: 60_000 }),
+      (error) => error.code === 'EXECUTION_MAY_BE_ACTIVE'
+        && error.details?.blockedByExecutionRisk?.taskId === task.id
+        && /force=true/.test(error.details.resolution),
+    )
+    assert.equal(store.inspectLock(), null, 'a rejected writer must not create a lock')
+  })
+
+  it('allows a new writer after same-turn explicit resolution, but not after an old resolved turn', async () => {
+    const workspace = await makeWorkspace()
+    const store = new WorkspaceStore(workspace)
+    const task = store.createTask({ title: 'Resolved risk', packet: '# resolved\n', writeScopes: ['out.txt'] })
+    task.state = 'interrupted'
+    task.turnIndex = 1
+    task.executionMayBeActive = true
+    task.runner = { instance: 'dead-runner', pid: 2_147_483_647, turn: 1, acpPid: process.pid }
+    store.saveTask(task)
+    const incidentAt = new Date().toISOString()
+    store.writeIncident(task, { kind: 'control-lost', turn: 1, at: incidentAt, executionMayBeActive: true })
+    store.saveTask(task)
+    assert.throws(() => store.acquireLock({ owner: 'astra' }), /unresolved execution risk/)
+
+    const resolvedAt = new Date(Date.now() + 1000).toISOString()
+    store.updateTask(task.id, (fresh) => {
+      fresh.executionMayBeActive = false
+      fresh.executionMayBeActiveResolvedAt = resolvedAt
+      fresh.executionMayBeActiveResolvedTurn = 1
+      fresh.incident = { ...fresh.incident, executionMayBeActive: false, resolvedAt }
+      return fresh
+    })
+    const lock = store.acquireLock({ owner: 'astra', ttlMs: 60_000 })
+    assert.equal(lock.owner, 'astra')
+    store.releaseLock(lock.token)
+
+    const next = store.createTask({ title: 'Next turn task', packet: '# next\n', writeScopes: ['out.txt'] })
+    next.turnIndex = 2
+    next.executionMayBeActive = false
+    store.saveTask(next)
+    writeFileSync(join(store.taskDir(next.id), 'incident-control-lost.json'), `${JSON.stringify({
+      kind: 'control-lost',
+      turn: 1,
+      at: incidentAt,
+      executionMayBeActive: true,
+    }, null, 2)}\n`)
+    const nextLock = store.acquireLock({ owner: 'astra', ttlMs: 60_000 })
+    assert.equal(nextLock.owner, 'astra')
+  })
+
+  it('fails closed with EXECUTION_RISK_UNKNOWN when a risk record is unreadable', async () => {
+    const workspace = await makeWorkspace()
+    const store = new WorkspaceStore(workspace)
+    const task = store.createTask({ title: 'Corrupt risk', packet: '# corrupt\n' })
+    writeFileSync(join(store.taskDir(task.id), 'incident.json'), '{not json')
+    assert.throws(
+      () => store.acquireLock({ owner: 'astra' }),
+      (error) => error.code === 'EXECUTION_RISK_UNKNOWN' && /cannot read/.test(error.message),
+    )
+    assert.equal(store.inspectLock(), null)
+  })
+
   it('detects file changes without git', async () => {
     const workspace = await makeWorkspace()
     writeFileSync(join(workspace, 'seed.txt'), 'seed\n')

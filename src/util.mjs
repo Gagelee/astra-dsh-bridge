@@ -151,15 +151,43 @@ export function oneLine(text, max = 240) {
   return truncate(String(text ?? '').replace(/\s+/g, ' ').trim(), max, '…')
 }
 
-/** Whether a PID is alive (best effort, never throws). */
-export function isPidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false
+/**
+ * Classify a PID. `EPERM` means the process exists but we may not signal it, so
+ * it must never be reported as dead. Genuinely unclassifiable errors are
+ * `unknown` for the same reason.
+ * @param {number} pid
+ * @param {(pid:number, signal:number)=>void} [kill]
+ * @returns {'alive'|'dead'|'unknown'}
+ */
+export function pidState(pid, kill = process.kill) {
+  if (!Number.isInteger(pid) || pid <= 0) return 'dead'
   try {
-    process.kill(pid, 0)
-    return true
+    kill(pid, 0)
+    return 'alive'
   } catch (error) {
-    return Boolean(error && error.code === 'EPERM')
+    if (error && error.code === 'EPERM') return 'unknown'
+    if (error && error.code === 'ESRCH') return 'dead'
+    return 'unknown'
   }
+}
+
+/** Whether a PID is alive (EPERM/unknown counts as alive so we never assert death). */
+export function isPidAlive(pid, kill = process.kill) {
+  return pidState(pid, kill) !== 'dead'
+}
+
+/** Redact common secret shapes before a diagnostic snippet is persisted. */
+export function redactSecrets(text) {
+  return String(text ?? '')
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s]+/gi, '$1[redacted]')
+    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|authorization)\s*[:=]\s*)[^\s,;]+/gi, '$1[redacted]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, 'sk-[redacted]')
+    .replace(/\b(Bearer)\s+[A-Za-z0-9._~+/-]{12,}/g, '$1 [redacted]')
+}
+
+/** Bounded, redacted stderr tail suitable for an incident record. */
+export function summarizeStderr(text, max = 1200) {
+  return truncate(redactSecrets(String(text ?? '').trim()), max)
 }
 
 /** Await a fixed number of milliseconds. */

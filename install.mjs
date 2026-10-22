@@ -44,7 +44,7 @@ const nodePath = process.execPath
 const serverPath = join(bridgeDir, 'src', 'mcp-server.mjs')
 const dshBin = process.env.ASTRA_DSH_DSH_BIN || findDsh()
 const dshHome = resolve(process.env.ASTRA_DSH_DSH_HOME || join(homedir(), '.dsh'))
-const model = process.env.ASTRA_DSH_MODEL || 'deepseek-v4-pro'
+const model = process.env.ASTRA_DSH_MODEL || 'deepseek-flash'
 
 const CONFIG_START = '# >>> astra-dsh bridge (managed) >>>'
 const CONFIG_END = '# <<< astra-dsh bridge (managed) <<<'
@@ -166,10 +166,10 @@ function installAgents() {
   const block = `${AGENTS_START}
 ## Astra ↔ DSH 协作
 
-当用户要求把实现/改造交给 **DSH** 执行、提到 Astra/DSH 协作、或要求从共享任务板 pickup 需求时，使用 \`astra-dsh\` skill 与 MCP server \`astra_dsh\` 的工具。
+仅在用户明确要求委派 DSH、查询/续接/验收已有 DSH 任务、或从共享任务板 pickup 需求时，使用 \`astra-dsh\` skill 与 MCP server \`astra_dsh\` 的工具；与已授权 DSH 任务明确相关的完成通知沿用该授权。
 
 - Astra 负责规划、拆解、派发、审阅和验收；DSH 负责在共享工作目录执行。
-- 当前项目存在 \`.astra-dsh/\` 时，在开始一个新需求前先调用 \`astra_inbox\` 检查是否有 DSH 放入的需求或待审阅任务。
+- 满足上述触发条件后，再调用 \`astra_inbox\` 检查相关需求和任务。普通问答、分析、文档编写或直接实现由 Codex 处理；项目中存在 \`.astra-dsh/\`、历史使用过集成或仅出现“继续/交接”等词不构成触发条件。
 - 派发任务必须包含可验证的验收标准；审阅时读取共享目录中的真实改动，不要只信 DSH 的文字总结。
 ${AGENTS_END}`
   const next = `${replaceManaged(existing, AGENTS_START, AGENTS_END, block).trimEnd()}\n`

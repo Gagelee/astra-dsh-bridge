@@ -2,22 +2,39 @@
  * Manual end-to-end check against a real DSH ACP server. Not part of `npm test`
  * because it needs working DeepSeek credentials and spends tokens.
  *
- *   ASTRA_DSH_DSH_HOME=~/.dsh node scripts/real-e2e.mjs /path/to/workspace
+ * Defaults to an ISOLATED DSH home under a temp dir and GUI grouping disabled,
+ * so a run never leaves a workspace in the shared DSH GUI nor touches ~/.dsh.
+ * Set REAL_E2E_SHARED_GUI=1 (and optionally REAL_E2E_DSH_HOME) to use the real
+ * shared ~/.dsh and let the GUI plugin group the session.
+ *
+ *   node scripts/real-e2e.mjs /path/to/workspace
  */
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const workspace = process.argv[2] ?? process.cwd()
 const server = fileURLToPath(new URL('../src/mcp-server.mjs', import.meta.url))
+
+// Isolate by default; opt in to the shared GUI explicitly.
+const sharedGui = process.env.REAL_E2E_SHARED_GUI === '1'
+const dshHome = sharedGui
+  ? (process.env.REAL_E2E_DSH_HOME ?? process.env.ASTRA_DSH_DSH_HOME ?? join(process.env.HOME ?? '/tmp', '.dsh'))
+  : mkdtempSync(join(tmpdir(), 'astra-dsh-real-e2e-'))
+
 const child = spawn(process.execPath, [server], {
   cwd: workspace,
   env: {
     ...process.env,
     ASTRA_DSH_DSH_BIN: process.env.ASTRA_DSH_DSH_BIN ?? 'dsh',
+    ASTRA_DSH_DSH_HOME: dshHome,
     ASTRA_DSH_MODEL: process.env.ASTRA_DSH_MODEL ?? 'deepseek-v4-pro',
     ASTRA_DSH_EFFORT: process.env.ASTRA_DSH_EFFORT ?? 'high',
     ASTRA_DSH_PERMISSION_POLICY: process.env.ASTRA_DSH_PERMISSION_POLICY ?? 'allow',
+    ASTRA_DSH_NOTIFY_CODEX: '0',
   },
   stdio: ['pipe', 'pipe', 'pipe'],
 })
@@ -49,22 +66,26 @@ async function call(name, args) {
   return result.structuredContent ?? { text: result.content?.[0]?.text }
 }
 
+console.log(`real-e2e: dshHome=${dshHome} sharedGui=${sharedGui}`)
+
 try {
   await request('initialize', { protocolVersion: '2025-06-18', clientCapabilities: {} })
   const dispatched = await call('dsh_dispatch', {
     workspace,
     title: 'Real ACP end-to-end',
     goal: 'Create a file named real-e2e.txt in the workspace containing exactly "hello from real DSH". Then reply with REAL_E2E_OK and a one-line summary.',
-    context: 'This is the first real end-to-end validation of the Astra-DSH bridge. The workspace is shared; Astra will inspect the file afterwards.',
+    context: 'This is a real end-to-end validation of the Astra-DSH bridge. The workspace is shared; Astra will inspect the file afterwards.',
+    implementationPlan: 'Use the shell to create real-e2e.txt with the exact content, then report REAL_E2E_OK.',
     acceptance: ['real-e2e.txt exists with the exact requested content', 'Final reply contains REAL_E2E_OK'],
     constraints: ['Only create real-e2e.txt; do not touch other files'],
     writeScopes: ['real-e2e.txt'],
+    guiPolicy: sharedGui ? 'create' : 'off',
     reviewMode: process.env.REAL_E2E_REVIEW_MODE ?? 'full',
     verifyCommands: process.env.REAL_E2E_VERIFY ? [process.env.REAL_E2E_VERIFY] : [],
   })
   console.log('dispatched', dispatched)
   const waited = await call('dsh_wait', { workspace, taskId: dispatched.taskId, timeoutSec: 240 })
-  console.log('state:', waited.state, 'stop:', waited.stopReason)
+  console.log('state:', waited.state, 'stop:', waited.stopReason, 'gui:', waited.guiPolicy, waited.guiStatus)
   console.log('text:', waited.lastAssistantText)
   console.log('changed:', waited.changedFiles)
   const result = await call('dsh_result', { workspace, taskId: dispatched.taskId })

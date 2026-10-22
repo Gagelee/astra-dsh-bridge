@@ -1,6 +1,6 @@
 ---
 name: astra-dsh
-description: 当用户要求把实现/改造交给 DSH 执行、要求在 Codex 中规划后由 DSH 落地、要查询或续接 DSH 任务、或要从共享任务板 pickup 需求时使用。Astra 负责规划、拆解、派发、审阅与验收；DSH 负责在共享工作目录执行。支持双向追加指令、回答问题、取消与返工。
+description: 仅用于用户明确委派 DSH、查询/续接/验收已有 DSH 任务、从共享任务板 pickup 需求，以及已授权任务的完成通知。Astra 负责规划与验收，DSH 负责执行。普通问答、分析、文档编写和直接实现不因项目存在 .astra-dsh 目录而启用本技能。
 ---
 
 # Astra ↔ DSH 协作
@@ -12,43 +12,40 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 
 ## 0. 开始工作前
 
-如果满足任一条件，先调用 `astra_inbox`：
+仅在以下请求中启用协作流程，并先调用 `astra_inbox`：
 
-- 用户提到 DSH、Astra、任务板、共享目录、pickup、交接、继续执行。
-- 用户说“这个需求交给 DSH”“让 DSH 做”“看看 DSH 做得怎么样”。
-- 当前项目存在 `.astra-dsh/`，且用户提出了一个新需求。
+- 用户明确要求把当前任务交给 DSH 执行，或从共享任务板 pickup 需求。
+- 用户要求查询、续接、审阅或验收已有 DSH 任务。
+- 当前消息是与已授权 DSH 任务明确相关的继续指令或任务完成通知，沿用该任务授权。
 
-`astra_inbox` 会返回：待规划的需求、等待你审阅的 DSH 任务、正在运行的任务。若用户明确只是问问题、不需要执行，则不要为了走流程而派发任务。
+普通问答、分析、文档编写和直接实现由 Codex 处理。项目中存在 `.astra-dsh/`、历史使用过集成、仅提到 DSH/Astra，或出现“继续/交接/共享目录”等词，都不自动触发协作流程。讨论集成配置或触发规则时直接处理相应问题。
+
+`astra_inbox` 用于读取已触发流程中的相关需求和任务；查询任务不代表授权派发新任务。
 
 确认 `workspace` 时使用项目根目录的绝对路径；不要用 `~` 或相对路径。
 
-## 0.1 交接前评估（很重要）
+## 0.1 交接前评估（模型判断，标准固定）
 
-默认 `light`，不要每个任务都 `full`。派发前用 30 秒判断：
+`reviewMode` 不是按任务类型查表，而是对“验收证据是否足够”的判断。选**成本最低但证据充分**的档位；不要为了省事降档，也不要为了保险一律 `full`。
 
-**必须 Astra 亲自验收（`full`）**
+判断风险时看这些维度，而不是看标题：
 
-- 认证、权限、密钥、安全边界
-- 数据迁移、删除、不可逆操作
-- 公共 API、跨模块契约、架构调整
-- 用户可见的交互、设计、文案
-- 没有可靠自动化验证，或需求有歧义
-- 改动跨服务/跨仓库，或预计越出 `writeScopes`
+- **影响面**：单文件/单函数，还是公共 API、跨模块契约、跨服务
+- **可逆性**：可回滚的代码改动，还是数据迁移、删除、权限/密钥、不可逆操作
+- **可观测性**：能否用确定性命令/测试证明，还是依赖主观判断（交互、文案、设计）
+- **不确定性**：需求清楚、边界明确，还是有歧义、需要产品决策
+- **并发/生命周期**：是否涉及锁、进程退出、通知重试、长任务、竞态
+- **环境依赖**：本地可复现，还是依赖外部服务/真实 GUI/平台差异
 
-**可以交给 DSH/桥（`auto`）**
+档位的**证据标准**：
 
-- 格式化、注释、文档
-- 局部 bug fix，且已有测试覆盖
-- 机械替换、生成代码、重命名
-- 配置/脚本改动，且能用命令验证
-- 只改测试
+- `auto`：改动机械、边界封闭，且验证命令通过就等价于验收；没有需要人判断的语义。桥自动签收，Astra 不进入验收回合。
+- `light`：局部、可逆、diff 可读，失败能被现有测试/`verifyCommands` 捕获。Astra 必须看真实 diff + 关键文件 + 桥的 verification；**不需要重跑全量测试**。
+- `full`：上述任一高风险维度命中，或 `light` 证据不足以回答“是否满足需求”。Astra 需要独立证据，但仍应 targeted：变更相关测试 + 关键路径 + 一次 smoke；不要默认把 DSH 跑过的全量套件再跑一遍。
 
-**默认 `light`**
+升级规则：`light` 过程中如果出现验证失败、测试不稳定、改动越出 `writeScopes`、对需求语义有实质疑问，就升级 `full`。不要为了省 token 把已经暴露的不确定性压回 `light`。
 
-- 局部、低风险、diff 可读
-- 桥跑 `verifyCommands`；Astra 只看 diff + 关键文件，不重跑全量测试
-
-命中风险清单才升级 `full`；不要为了“保险”把所有任务都设成 `full`，那会显著增加你的验收轮数和上下文消耗。
+在 `context` 或 `notes` 里写一句选择理由（例如“局部可逆 + 现有测试覆盖，选 light”“改通知/锁生命周期，选 full”），方便用户复核；不需要为此增加固定字段。
 
 ## 1. 规划与拆解（Astra 的职责）
 
@@ -82,7 +79,8 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
   "writeScopes": ["src/report.ts"],
   "reviewMode": "light",
   "verifyCommands": ["npm test -- --runInBand"],
-  "model": "deepseek-v4-pro",
+  "guiPolicy": "existing",
+  "model": "deepseek-flash",
   "reasoningEffort": "high"
 }
 ```
@@ -90,6 +88,7 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 要求：
 
 - `goal`、`implementationPlan` 与 `acceptance` 必填；`taskKind=implement` 还必须有 `writeScopes`。
+- `guiPolicy` 控制 GUI 归组：`existing`（默认，只复用同路径已注册工作区，不存在则跳过不建）、`create`（允许插件创建，title 缺省取目录名）、`off`（不发布、不归组）。默认 `existing`，不要为了让会话出现在 GUI 而选 `create`。
 - `implementationPlan` 是 Astra 的分析结论和实施方向，不是让 DSH 重新做规划；DSH 可以在此基础上做实现级分析。
 - 验收标准必须能被检查（文件存在、测试通过、行为改变），不要写“质量好”。
 - `context` 写决策和事实，不写你的内部推理过程。
@@ -127,15 +126,20 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 
 `dsh_wait` 只是诊断/兜底工具，正常流程不要使用；如果用了，桥会抑制完成通知以避免双唤醒。
 
-### 验收分级怎么选
-
-| 任务特征 | 建议 |
-|---|---|
-| 机械、确定性高、有可靠测试/校验命令、改动范围明确 | `auto` + 1–5 条 `verifyCommands` + `writeScopes` |
-| 低风险、需要看 diff 但不需要完整测试 | `light` + 可选 `verifyCommands` |
-| 跨模块、接口/数据变更、需求有歧义、生产相关 | `full` |
+### 验收证据与复跑标准
 
 `verifyCommands` 是桥独立执行的证据，不是 DSH 自述。命令必须能在共享工作目录直接运行，并返回 0 表示通过；不要写交互式命令或会长时间挂起的进程。最多 5 条，每条默认 120s 超时。
+
+**独立复跑不是仪式。** 只有在下列情况下，Astra 才需要自己再跑测试：
+
+- 任务修改了测试本身，或修改了测试夹具/并发调度
+- 测试或验证结果出现不一致、flaky、超时、环境相关差异
+- 改动涉及并发、锁、进程生命周期、通知重试、崩溃恢复等难以用一次运行证明的语义
+- DSH 的证据无法覆盖关键验收标准，需要独立环境/独立命令补证
+
+不满足这些条件时，`light` 应直接使用桥的 verification + diff + 关键文件，不重跑 DSH 已经跑过的全量套件。即使 `full`，也优先跑**变更相关测试 + 一个 smoke**；只有明确的 flaky/race 假设才重复全量，并记录重复次数和假设。
+
+同一条确定性命令，DSH 跑一遍、Astra 再跑一遍，不构成额外证据；独立证据应该来自**不同的检查角度**（真实文件、边界输入、失败路径、交叉模块契约），而不是复制同一条命令。
 
 `auto` 的自动签收条件（任一不满足就保持 `idle` 等 Astra）：
 
@@ -152,7 +156,7 @@ MCP server `astra_dsh` 提供 `astra_*` 与 `dsh_*` 工具（Codex 中可能显�
 - `codex queue` 的 thread id 来自 Codex 每次 MCP 调用 `_meta.threadId`，不需要固定会话名。
 - 多个任务同时完成会合并成一条通知；`auto` 已签收或 `cancelled` 的任务不唤醒。
 - 桥在回合结束后主动跑 `verifyCommands`（本地进程，不消耗模型 token）。
-- 如果触发失败，任务仍在板上，记录 `notifyError`；用户/你可以稍后 `dsh_status` 查看，不要改回轮询循环。
+- 如果触发失败，通知会进入持久 outbox 并按退避重试，桥重启后继续；`dsh_status` 的 `notification` 显示 `pending/retrying/degraded` 和 `lastError`。任务仍在板上，不要改回轮询循环。
 
 ### 需求确认 reviewer（可选，默认不启用）
 
@@ -204,8 +208,12 @@ Astra 拿到 `PASS` 后再 `dsh_review accepted`；`FAIL` 就把 `GAPS` 转成 `
 
 ### 失败与恢复
 
-- `state=failed` / `interrupted`：先 `dsh_result` 看错误和部分输出，再决定 `dsh_message` 继续，还是重新拆任务。
-- 桥重启后任务会变为 `interrupted`；`dsh_message` 会自动 resume 会话，失败时桥会新建会话（任务包仍在，记录 `sessionRecreated`）。
+- `state=failed` / `interrupted`：先 `dsh_result` / `dsh_status` 看 `incident`（错误码、退出码、stderr 摘要、部分输出、最后工具）再决定继续还是重新拆任务。
+- 如果 `executionMayBeActive=true`，说明控制连接异常丢失时 ACP 可能仍在执行。桥故意保留锁并拒绝自动 resume；所有新写入口（`dsh_dispatch`/`astra_lock acquire`/queued turn）也会拒绝，即使 lock owner PID 已死、TTL 过期或锁缺失。先在桥外确认旧 DSH/ACP 进程已停止，再处理任务。不要把它当成“任务已停止”。
+- `dsh_cancel` 返回 `cancelConfirmed=false` / `lockRetained=true` 时，表示 ACP 未在宽限内确认停止；不要据此认为已停止，也不要直接起第二个写者。
+- GUI 显示“任务已停止/进程退出”不是 ACP 退出证据；外部 ACP 冷读会补 interrupted closer，见 `docs/EXTERNAL_SESSION_GUI.md`。
+- 桥重启后任务会变为 `interrupted`；确认没有活跃执行后，`dsh_message` 会自动 resume 会话，失败时桥会新建会话（任务包仍在，记录 `sessionRecreated`）。
+- `health=suspected-stall` 只是 warning：任务仍在 running、锁仍保留；长工具可能只是安静。不要因此 cancel 或重复派发，先看 `lastTool`/`lastAcpUpdateAt`。
 - 不要因为一次超时就重复派发同一个任务；先 `dsh_status` 确认是否还在运行。
 
 ## 5. 从 DSH 侧 pickup 需求

@@ -1,16 +1,19 @@
 {
   "name": "@astra-dsh/workspace-attach",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
-  "description": "Attaches DSH ACP execution sessions to their project workspaces automatically.",
+  "description": "Attaches DSH ACP execution sessions to their project workspaces and publishes external ACP sessions into the GUI catalog.",
   "exports": {
     ".": "./index.js",
+    "./protocol": "./protocol.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "protocol.js",
+    "repair.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"

@@ -147,7 +147,11 @@ async function main() {
       process.stdout.write(`- Requests: ${requests.length} (${requests.filter((request) => request.state === 'open').length} open)\n`)
       process.stdout.write(`- Tasks: ${tasks.length} (${tasks.filter((task) => task.state === 'running').length} running, ${tasks.filter((task) => task.state === 'idle').length} idle)\n`)
       const lock = store.inspectLock()
-      process.stdout.write(`- Lock: ${lock ? `${lock.owner}${lock.taskId ? ` (${lock.taskId})` : ''}` : 'free'}\n`)
+      const risk = store.executionRiskSummary()
+      process.stdout.write(`- Lock: ${lock ? `${lock.owner}${lock.taskId ? ` (${lock.taskId})` : ''}` : 'free'}${lock?.blockedByExecutionRisk ? ` · BLOCKED by execution risk ${lock.blockedByExecutionRisk.taskId ?? 'unknown'}` : ''}\n`)
+      if (risk) {
+        process.stdout.write(`- Execution risk: ${risk.taskId ?? 'unknown'} ${risk.state ?? ''} turn ${risk.turn ?? '?'} · new writers are refused until verified resolution\n`)
+      }
       return 0
     }
     case 'diff': {

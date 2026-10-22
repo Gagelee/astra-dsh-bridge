@@ -9,6 +9,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { loadConfig } from './config.mjs'
 import { WorkspaceStore } from './store.mjs'
 import { TaskRunner } from './task-runner.mjs'
+import { GUI_POLICIES, DEFAULT_GUI_POLICY } from './attach.mjs'
 import { BridgeError, nowIso, oneLine, resolveWorkspace, truncate } from './util.mjs'
 
 const WORKSPACE = {
@@ -164,13 +165,23 @@ export const TOOL_DEFINITIONS = [
           items: { type: 'string' },
           description: 'Workspace-relative paths DSH is expected to touch; used for overlap warnings.',
         },
-        model: { type: 'string', description: 'Optional DSH model id, e.g. deepseek-v4-pro or deepseek-v4-flash.' },
+        model: { type: 'string', description: 'Optional DSH model id, e.g. deepseek-flash or deepseek-v4-pro.' },
         reasoningEffort: { type: 'string', enum: ['off', 'low', 'high', 'max'] },
         reviewMode: {
           type: 'string',
           enum: ['auto', 'light', 'full'],
           description:
             'Acceptance tier. auto: bridge runs verifyCommands and auto-accepts only if every check passes, no questions, and changes stay inside writeScopes. light: bridge runs verification, Astra reviews diff/files but not a full acceptance pass. full: Astra performs the full acceptance review. light is the default. auto requires verifyCommands.',
+        },
+        guiPolicy: {
+          type: 'string',
+          enum: GUI_POLICIES,
+          description:
+            'How the DSH GUI should group this task\'s session. existing (default): only reuse an already-registered workspace for the same canonical path, and skip without creating one otherwise. create: allow the GUI plugin to create the workspace if missing. off: do not deliver anything to the GUI. Old tasks without a policy behave as existing.',
+        },
+        guiWorkspaceTitle: {
+          type: 'string',
+          description: 'Optional display title used only when guiPolicy=create actually creates a new workspace.',
         },
         verifyCommands: {
           type: 'array',
@@ -230,6 +241,16 @@ export const TOOL_DEFINITIONS = [
     annotations: { readOnlyHint: true },
   },
   {
+    name: 'dsh_gui_retry',
+    description:
+      'Controlled retry for GUI session visibility/grouping: re-enqueue the attach request for a task whose GUI delivery failed, was skipped, or is still waiting. Safe to call when astra_status shows an unregistered/failed/private-home or stale GUI state. Does not start or resume any DSH turn.',
+    inputSchema: {
+      type: 'object',
+      properties: { workspace: WORKSPACE, taskId: TASK_ID },
+      required: ['workspace', 'taskId'],
+    },
+  },
+  {
     name: 'dsh_message',
     description:
       'Send Astra follow-up to a DSH task: answer a QUESTION:, request changes, add constraints, or start the next turn after review. If DSH is running, mode=queue (default) delivers it immediately after the current turn; mode=interrupt cancels the current turn first. If DSH is idle, it starts a new turn on the same persistent session.',
@@ -240,6 +261,11 @@ export const TOOL_DEFINITIONS = [
         taskId: TASK_ID,
         message: { type: 'string' },
         mode: { type: 'string', enum: ['queue', 'interrupt'] },
+        force: {
+          type: 'boolean',
+          description:
+            'Only after independently verifying the old DSH/ACP process is stopped: clear executionMayBeActive/incident resolution and release the retained lock before resuming. Defaults to false and is refused otherwise.',
+        },
       },
       required: ['workspace', 'taskId', 'message'],
     },
@@ -327,7 +353,7 @@ export const TOOL_DEFINITIONS = [
 ]
 
 /** Dispatch one MCP tools/call. Returns `{ text, structured, isError }`. */
-export async function callTool(name, args, bridge, { signal } = {}) {
+export async function callTool(name, args, bridge, { signal, meta = null } = {}) {
   const input = args && typeof args === 'object' ? args : {}
   switch (name) {
     case 'astra_inbox':
@@ -341,13 +367,15 @@ export async function callTool(name, args, bridge, { signal } = {}) {
     case 'astra_lock':
       return astraLock(bridge, input)
     case 'dsh_dispatch':
-      return dshDispatch(bridge, input)
+      return dshDispatch(bridge, input, meta)
     case 'dsh_list':
       return dshList(bridge, input)
     case 'dsh_status':
       return dshStatus(bridge, input)
     case 'dsh_wait':
       return dshWait(bridge, input, signal)
+    case 'dsh_gui_retry':
+      return dshGuiRetry(bridge, input)
     case 'dsh_message':
       return dshMessage(bridge, input)
     case 'dsh_cancel':
@@ -361,7 +389,7 @@ export async function callTool(name, args, bridge, { signal } = {}) {
     case 'dsh_read_file':
       return dshReadFile(bridge, input)
     case 'astra_status':
-      return astraStatus(bridge, input)
+      return astraStatus(bridge, input, meta)
     default:
       throw new BridgeError(`unknown tool: ${name}`, { code: 'UNKNOWN_TOOL' })
   }
@@ -385,18 +413,34 @@ function astraInbox(bridge, input) {
   })
   const awaiting = tasks.filter((task) => task.awaitingAstra)
   const running = tasks.filter((task) => task.state === 'running')
+  const attention = tasks.filter((task) => task.executionMayBeActive || task.incidentKind || ['degraded', 'retrying'].includes(task.notificationHealth))
   const closed = input.includeClosed ? tasks.filter((task) => ['accepted', 'rejected'].includes(task.state)) : []
   const lines = [`# Shared board — ${store.workspace}`, '']
   lines.push(`## Requirements (${requests.length})`)
   lines.push(requests.length ? requests.map((request) => `- \`${request.id}\` [${request.state}/${request.priority}] ${request.title} — origin ${request.origin}`).join('\n') : '_No open requirements._')
+  if (attention.length) {
+    lines.push('', `## Attention (${attention.length})`)
+    lines.push(attention.map((task) => {
+      const flags = []
+      if (task.executionMayBeActive) flags.push('EXECUTION MAY BE ACTIVE — do not resume/start a second writer')
+      if (task.incidentKind) flags.push(`incident ${task.incidentKind}`)
+      if (task.notificationHealth === 'degraded') flags.push('notification DEGRADED')
+      else if (task.notificationHealth === 'retrying') flags.push('notification retrying')
+      return `- \`${task.taskId}\` ${task.state} — ${task.title} · ${flags.join(' · ')}`
+    }).join('\n'))
+  }
   lines.push('', `## Awaiting Astra review (${awaiting.length})`)
   lines.push(awaiting.length ? awaiting.map((task) => {
     const verified = task.verificationOk === null ? 'verify n/a' : task.verificationOk ? 'verify pass' : 'verify FAIL'
     const reasons = task.autoReview?.reasons?.length ? ` · auto blocked: ${oneLine(task.autoReview.reasons.join('; '), 180)}` : ''
-    return `- \`${task.taskId}\` ${task.state} — ${task.title} · ${task.reviewMode} · ${verified}${task.questionCount ? ` · ${task.questionCount} question(s)` : ''}${reasons}`
+    const health = task.executionMayBeActive ? ' · EXECUTION MAY BE ACTIVE' : task.incidentKind ? ` · incident ${task.incidentKind}` : ''
+    return `- \`${task.taskId}\` ${task.state} — ${task.title} · ${task.reviewMode} · ${verified}${task.questionCount ? ` · ${task.questionCount} question(s)` : ''}${reasons}${health}`
   }).join('\n') : '_None._')
   lines.push('', `## Running (${running.length})`)
-  lines.push(running.length ? running.map((task) => `- \`${task.taskId}\` ${task.title}`).join('\n') : '_None._')
+  lines.push(running.length ? running.map((task) => {
+    const health = task.executionMayBeActive ? ' · EXECUTION MAY BE ACTIVE' : task.incidentKind ? ` · incident ${task.incidentKind}` : ''
+    return `- \`${task.taskId}\` ${task.title}${health}`
+  }).join('\n') : '_None._')
   if (closed.length) {
     lines.push('', `## Closed (${closed.length})`)
     lines.push(closed.map((task) => `- \`${task.taskId}\` ${task.state} — ${task.title}`).join('\n'))
@@ -410,6 +454,7 @@ function astraInbox(bridge, input) {
       requests,
       tasksAwaitingAstra: awaiting,
       runningTasks: running,
+      attention,
       closedTasks: closed,
     },
   }
@@ -458,7 +503,15 @@ function astraLock(bridge, input) {
   const { store } = bridge.forWorkspace(input.workspace)
   const action = requireString(input.action, 'action')
   if (action === 'status') {
-    return { text: `${renderLock(store.inspectLock())}\n\nBoard: \`${store.root}\``, structured: { lock: store.inspectLock() } }
+    const lock = store.inspectLock()
+    const executionRisk = store.executionRiskSummary()
+    const riskLine = executionRisk
+      ? `\nExecution risk: ${executionRisk.taskId ?? 'unknown'} ${executionRisk.state ?? ''} turn ${executionRisk.turn ?? '?'} — new writers are refused until verified resolution.`
+      : ''
+    return {
+      text: `${renderLock(lock)}${riskLine}\n\nBoard: \`${store.root}\``,
+      structured: { lock, executionRisk },
+    }
   }
   if (action === 'release') {
     const current = store.inspectLock()
@@ -492,11 +545,11 @@ function astraLock(bridge, input) {
   }
 }
 
-async function dshDispatch(bridge, input) {
+async function dshDispatch(bridge, input, meta) {
   const { store, runner } = bridge.forWorkspace(input.workspace)
   const task = await runner.dispatch({
     ...input,
-    codexThreadId: bridge.codexCallMeta?.threadId ?? null,
+    codexThreadId: meta?.threadId ?? null,
   })
   if (input.requestId) {
     try {
@@ -509,7 +562,7 @@ async function dshDispatch(bridge, input) {
     }
   }
   return {
-    text: `# DSH task started\n\n- **Task:** \`${task.taskId}\`\n- **State:** ${task.state}\n- **Session:** \`${task.sessionId}\`\n- **Packet:** \`${task.taskFile}\`\n\nDSH is implementing Astra's plan in the shared workspace. When it settles, the bridge will queue a message into this same Codex thread; do not poll with \`dsh_wait\`. Use \`dsh_status\` only for diagnostics or when the user asks.`,
+    text: `# DSH task started\n\n- **Task:** \`${task.taskId}\`\n- **State:** ${task.state}\n- **Session:** \`${task.sessionId}\`\n- **GUI policy:** ${task.guiPolicy}\n- **Monitor:** ${task.monitor?.watchdog ?? 'unknown'}${task.degraded?.length ? `\n- **DEGRADED:** ${task.degraded.join('; ')}` : ''}\n- **Packet:** \`${task.taskFile}\`\n\nDSH is implementing Astra's plan in the shared workspace. When it settles, the bridge will queue a message into this same Codex thread via \`codex queue --thread\`; do not poll with \`dsh_wait\`. Use \`dsh_status\` only for diagnostics or when the user asks.`,
     structured: task,
   }
 }
@@ -543,26 +596,41 @@ async function dshWait(bridge, input, signal) {
   }
 }
 
+function dshGuiRetry(bridge, input) {
+  const { store, runner } = bridge.forWorkspace(input.workspace)
+  const taskId = requireString(input.taskId, 'taskId')
+  const result = runner.retryGui(taskId)
+  return {
+    text: result.enqueued
+      ? `Re-enqueued GUI attach for \`${taskId}\` (session \`${result.sessionId}\`, policy ${result.guiPolicy}). The GUI plugin will pick it up from \`${result.attachQueueDir}\`.`
+      : `GUI attach is not deliverable for \`${taskId}\`: ${result.reason}.`,
+    structured: result,
+  }
+}
+
 function dshMessage(bridge, input) {
   const { runner } = bridge.forWorkspace(input.workspace)
   return runner.message(requireString(input.taskId, 'taskId'), requireString(input.message, 'message'), {
     mode: input.mode === 'interrupt' ? 'interrupt' : 'queue',
-  }).then((result) => ({
-    text: result.queued
+    force: Boolean(input.force),
+  }).then((result) => {
+    const text = result.queued
       ? `Queued Astra's message behind DSH's current turn (${result.queueLength} in queue). It will start automatically when the current turn settles.`
-      : `Message delivered to DSH; a new turn has started on the same session. Task: \`${result.taskId}\`.`,
-    structured: result,
-  }))
+      : result.blocked
+        ? `Message was queued for \`${result.taskId}\` but the new turn did not start (state=${result.state}${result.executionRisk ? `, execution risk ${result.executionRisk.taskId ?? 'unknown'}` : ''}). The queue is retained; resolve the risk/lock before retrying.`
+        : `Message delivered to DSH; a new turn has started on the same session. Task: \`${result.taskId}\`.`
+    return { text, structured: result }
+  })
 }
 
 async function dshCancel(bridge, input) {
   const { store, runner } = bridge.forWorkspace(input.workspace)
   const taskId = requireString(input.taskId, 'taskId')
   const result = await runner.cancel(taskId)
-  return {
-    text: `Cancelled \`${taskId}\`. Queued instructions were cleared; the session log is preserved. Use \`dsh_message\` to resume.\n\nBoard: \`${store.root}\``,
-    structured: result,
-  }
+  const text = result.cancelConfirmed
+    ? `Cancelled \`${taskId}\`. Queued instructions were cleared; the session log is preserved. Use \`dsh_message\` to resume.\n\nBoard: \`${store.root}\``
+    : `Cancellation of \`${taskId}\` was requested but ACP did not confirm the turn stopped (state=${result.state}, executionMayBeActive=${result.executionMayBeActive}). The workspace lock was retained; verify the old DSH/ACP process is stopped before resuming, or use \`dsh_message force=true\` only after that verification.\n\nBoard: \`${store.root}\``
+  return { text, structured: result }
 }
 
 function dshResult(bridge, input) {
@@ -570,7 +638,21 @@ function dshResult(bridge, input) {
   const payload = runner.result(requireString(input.taskId, 'taskId'), {
     includeDiff: Boolean(input.includeDiff),
   })
-  return { text: payload.resultMarkdown || `No result artifact yet for ${payload.taskId}.`, structured: payload }
+  const header = []
+  if (payload.executionMayBeActive) {
+    header.push('> **Execution may still be active.** Verify the old DSH/ACP process is stopped before resuming; the workspace lock may still be held.')
+  }
+  if (payload.incident) {
+    header.push(`**Incident:** ${payload.incident.kind ?? 'unknown'} at ${payload.incident.at ?? 'n/a'} — ${payload.incident.errorMessage ?? payload.incident.message ?? 'n/a'}`)
+    if (payload.incident.exitCode !== null && payload.incident.exitCode !== undefined) {
+      header.push(`**ACP exit:** code ${payload.incident.exitCode} signal ${payload.incident.signal ?? 'n/a'}`)
+    }
+  }
+  if (payload.notification?.health && payload.notification.health !== 'ok') {
+    header.push(`**Notifications:** ${renderNotificationPayload(payload.notification)}`)
+  }
+  const body = payload.resultMarkdown || `No result artifact yet for ${payload.taskId}.`
+  return { text: header.length ? `${header.join('\n')}\n\n${body}` : body, structured: payload }
 }
 
 async function dshReview(bridge, input) {
@@ -644,10 +726,11 @@ function dshReadFile(bridge, input) {
   }
 }
 
-function astraStatus(bridge, input) {
+function astraStatus(bridge, input, meta) {
   const { store, runner } = bridge.forWorkspace(input.workspace)
   const tasks = runner.list()
   const requests = store.listRequests()
+  const plugin = runner.guiPluginHealth()
   const payload = {
     workspace: store.workspace,
     board: store.root,
@@ -659,14 +742,38 @@ function astraStatus(bridge, input) {
       dshHome: runner.dshHome,
       dshHomeFallbackReason: runner.dshHomeFallbackReason,
       attachQueueDir: runner.attachQueueDir,
+      guiPolicyDefault: DEFAULT_GUI_POLICY,
       model: bridge.config.model,
       effort: bridge.config.effort,
-      codexThreadId: bridge.codexCallMeta?.threadId ?? process.env.CODEX_THREAD_ID ?? null,
-      codexSessionId: bridge.codexCallMeta?.sessionId ?? process.env.CODEX_SESSION_ID ?? null,
+      codexThreadId: meta?.threadId ?? process.env.CODEX_THREAD_ID ?? null,
+      codexSessionId: meta?.sessionId ?? process.env.CODEX_SESSION_ID ?? null,
       notifyCodex: bridge.config.notifyCodex !== false,
       codexBin: bridge.config.codexBin,
       permissionMode: bridge.config.permissionMode,
       permissionPolicy: bridge.config.permissionPolicy,
+      stallWarningMs: bridge.config.stallWarningMs,
+      progressHeartbeatMs: bridge.config.progressHeartbeatMs,
+      notificationRetryBaseMs: bridge.config.notifyRetryBaseMs,
+      notificationRetryMaxMs: bridge.config.notifyRetryMaxMs,
+      watchdog: bridge.config.watchdog,
+    },
+    gui: {
+      queueDir: runner.attachQueueDir,
+      plugin: plugin,
+      tasks: tasks.map((task) => ({
+        taskId: task.taskId,
+        title: task.title,
+        state: task.state,
+        guiPolicy: task.guiPolicy ?? DEFAULT_GUI_POLICY,
+        guiStatus: task.guiStatus ?? null,
+        sessionId: task.sessionId ?? null,
+        health: task.health ?? null,
+        executionMayBeActive: Boolean(task.executionMayBeActive),
+        incidentKind: task.incidentKind ?? null,
+        notificationHealth: task.notificationHealth ?? 'ok',
+      })),
+      notifications: runner.notificationSummary(),
+      attention: tasks.filter((task) => task.executionMayBeActive || task.incidentKind || ['degraded', 'retrying'].includes(task.notificationHealth)),
     },
     acp: {
       running: Boolean(runner.client?.alive),
@@ -674,6 +781,7 @@ function astraStatus(bridge, input) {
       activeTurns: [...runner.active.keys()],
     },
     lock: store.inspectLock(),
+    executionRisk: store.executionRiskSummary(),
     counts: {
       tasks: tasks.length,
       running: tasks.filter((task) => task.state === 'running').length,
@@ -682,19 +790,24 @@ function astraStatus(bridge, input) {
       openRequests: requests.filter((request) => request.state === 'open').length,
     },
   }
+  const pluginLine = plugin?.version
+    ? `GUI plugin ${plugin.version} · heartbeat ${plugin.heartbeatAt ?? 'none'}`
+    : (runner.attachQueueDir ? 'GUI plugin not seen yet (no heartbeat)' : 'GUI delivery disabled (fallback home)')
   const text = [
     `# Astra ↔ DSH bridge`,
     '',
     `- Workspace: \`${store.workspace}\``,
     `- Board: \`${store.root}\``,
     `- DSH: \`${bridge.config.dshBin}\` (home \`${runner.dshHome}\`)${runner.dshHomeFallbackReason ? `\n- **Fallback:** ${runner.dshHomeFallbackReason}` : ''}\n- Attach queue: \`${runner.attachQueueDir ?? 'disabled (fallback home)'}\``,
+    `- ${pluginLine}`,
     `- Model: ${bridge.config.model} · effort ${bridge.config.effort} · sandbox ${bridge.config.permissionMode} · ACP permission ${bridge.config.permissionPolicy}`,
     `- Verification timeout: ${bridge.config.verifyTimeoutMs}ms · max 5 commands`,
     `- Codex thread: \`${payload.bridge.codexThreadId ?? 'unavailable'}\` · session: \`${payload.bridge.codexSessionId ?? 'unavailable'}\``,
-    `- Completion trigger: ${payload.bridge.notifyCodex ? `codex queue via \`${payload.bridge.codexBin ?? 'missing codex binary'}\`` : 'disabled'}`,
+    `- Completion trigger: ${payload.bridge.notifyCodex ? `codex queue via \`${payload.bridge.codexBin ?? 'missing codex binary'}\`` : 'disabled'} · notifications ${renderNotifications(payload.gui.notifications)}`,
+    `- Watchdog: ${payload.bridge.watchdog ? 'per-turn sidecar enabled' : 'DISABLED (no independent bridge-crash alert)'} · stall warning ${payload.bridge.stallWarningMs ? `${Math.round(payload.bridge.stallWarningMs / 1000)}s` : 'off'}`,
     `- ACP process: ${payload.acp.running ? `running (${payload.acp.sessions.length} session(s))` : 'not started'}`,
     `- Active turns: ${payload.acp.activeTurns.length ? payload.acp.activeTurns.join(', ') : 'none'}`,
-    `- Lock: ${renderLock(payload.lock)}`,
+    `- Lock: ${renderLock(payload.lock)}${payload.executionRisk ? ` · BLOCKED by execution risk ${payload.executionRisk.taskId ?? 'unknown'} (turn ${payload.executionRisk.turn ?? '?'}${payload.executionRisk.executionMayBeActive ? ', may be active' : ''})` : ''}`,
     `- Tasks: ${payload.counts.tasks} total · ${payload.counts.running} running · ${payload.counts.awaitingAstra} awaiting Astra`,
     `- Requests: ${payload.counts.requests} total · ${payload.counts.openRequests} open`,
   ].join('\n')
@@ -711,9 +824,35 @@ function renderStatus(payload) {
     `- **Turn:** ${payload.turn} · session \`${payload.sessionId ?? 'n/a'}\``,
     `- **Updated:** ${payload.updatedAt}${payload.stopReason ? ` · stop ${payload.stopReason}` : ''}`,
     `- **Changed files:** ${payload.changedFiles?.length ?? 0} · queue ${payload.queueLength}`,
+    `- **Health:** ${payload.health?.status ?? 'unknown'}${payload.health?.severity ? ` (${payload.health.severity})` : ''}${payload.health?.reasons?.length ? ` — ${payload.health.reasons.join('; ')}` : ''}`,
+    `- **Last ACP update:** ${payload.lastAcpUpdateAt ?? 'n/a'} · bridge heartbeat ${payload.lastBridgeHeartbeatAt ?? 'n/a'}${payload.quietMs !== null && payload.quietMs !== undefined ? ` · quiet ${Math.round(payload.quietMs / 1000)}s` : ''}`,
+    `- **Monitor:** ${payload.monitor?.watchdog ?? 'unknown'}${payload.monitor?.reason ? ` — ${payload.monitor.reason}` : ''}`,
+    ...(payload.executionRisk ? [`- **Workspace execution risk:** ${payload.executionRisk.taskId ?? 'unknown'} ${payload.executionRisk.state ?? ''} turn ${payload.executionRisk.turn ?? '?'} · owner pid ${payload.executionRisk.ownerPid ?? 'unknown'} · acp pid ${payload.executionRisk.acpPid ?? 'unknown'} — new writers are refused until verified resolution`] : []),
+    `- **Notifications:** ${renderNotificationPayload(payload.notification)}`,
   ]
+  if (payload.executionMayBeActive) {
+    lines.push('', '> **Execution may still be active.** The control connection failed; the bridge did not release the workspace lock and refuses automatic resume. Verify the old DSH/ACP process is stopped before starting another writer.')
+  }
+  if (payload.stall?.suspectedAt && !payload.stall.recoveredAt) {
+    lines.push('', `> **Suspected stall (warning, not a failure).** No ACP update for ${Math.round((payload.stall.quietMs ?? 0) / 1000)}s; phase ${payload.stall.phase ?? 'unknown'}${payload.stall.tool?.title ? `, tool ${payload.stall.tool.title}` : ''}. The turn is still running and the lock is retained.`)
+  } else if (payload.stall?.recoveredAt) {
+    lines.push('', `_Stall warning cleared at ${payload.stall.recoveredAt}; ACP activity resumed._`)
+  }
+  if (payload.incident) {
+    lines.push('', `## Incident (${payload.incident.kind ?? 'unknown'})`, '', `- **At:** ${payload.incident.at ?? 'n/a'} · turn ${payload.incident.turn ?? 'n/a'} · phase ${payload.incident.phase ?? 'n/a'}`, `- **Reason:** ${payload.incident.errorMessage ?? payload.incident.message ?? 'n/a'}`)
+    if (payload.incident.exitCode !== null && payload.incident.exitCode !== undefined) lines.push(`- **ACP exit:** code ${payload.incident.exitCode} signal ${payload.incident.signal ?? 'n/a'}`)
+    if (payload.incident.lastTool?.title) lines.push(`- **Last tool:** ${payload.incident.lastTool.title}`)
+    if (payload.incident.partialText) lines.push('', '### Partial DSH output', '', truncate(payload.incident.partialText, 2000))
+    if (payload.incident.stderrSummary) lines.push('', '### ACP stderr tail', '', '```', payload.incident.stderrSummary, '```')
+  }
+  if (payload.modelSelection && payload.modelSelection !== 'verified' && payload.modelSelection !== 'matched') {
+    lines.push(`- **Model selection:** ${payload.modelSelection} (requested ${payload.requestedModel ?? 'n/a'}, actual ${payload.actualModel ?? 'n/a'})${payload.modelError ? ` — ${payload.modelError}` : ''}`)
+  }
+  if (payload.guiPolicy) {
+    lines.push(`- **GUI:** policy ${payload.guiPolicy} · status ${payload.guiStatus ?? '—'}${payload.guiStatusDetail ? ` · ${payload.guiStatusDetail}` : ''}`)
+  }
   if (payload.usage) lines.push(`- **Context:** ${payload.usage.used ?? '?'} / ${payload.usage.size ?? '?'} tokens`)
-  if (payload.lock) lines.push(`- **Lock:** ${renderLock(payload.lock)}`)
+  if (payload.lock) lines.push(`- **Lock:** ${renderLock(payload.lock)}${payload.lock.blockedByExecutionRisk ? ` · BLOCKED by execution risk ${payload.lock.blockedByExecutionRisk.taskId ?? 'unknown'}` : ''}`)
   if (payload.error) lines.push(`- **Error:** ${payload.error}`)
   if (payload.lastAssistantText) {
     lines.push('', '## Latest DSH text', '', truncate(payload.lastAssistantText, 2500))
@@ -746,6 +885,27 @@ function formatEvent(event) {
   const time = typeof event.t === 'string' ? event.t.slice(11, 19) : ''
   const detail = event.text ?? event.title ?? event.error ?? event.state ?? event.decision ?? event.status ?? ''
   return `- \`${time}\` ${event.type}${detail ? ` — ${oneLine(detail, 300)}` : ''}`
+}
+
+function renderNotificationPayload(summary) {
+  if (!summary) return 'unknown'
+  if (summary.health === 'ok' && !summary.counts?.sent) return 'none'
+  const parts = []
+  for (const key of ['pending', 'retrying', 'sending', 'sent', 'suppressed', 'degraded']) {
+    if (summary.counts?.[key]) parts.push(`${key} ${summary.counts[key]}`)
+  }
+  if (summary.nextAttemptAt) parts.push(`next ${summary.nextAttemptAt}`)
+  if (summary.lastError) parts.push(`last error: ${oneLine(summary.lastError, 200)}`)
+  return parts.join(' · ') || 'none'
+}
+
+function renderNotifications(summary) {
+  if (!summary) return 'unknown'
+  const parts = []
+  for (const key of ['pending', 'retrying', 'sent', 'degraded']) {
+    if (summary.counts?.[key]) parts.push(`${key} ${summary.counts[key]}`)
+  }
+  return parts.length ? parts.join(' · ') : 'idle'
 }
 
 function renderLock(lock) {
