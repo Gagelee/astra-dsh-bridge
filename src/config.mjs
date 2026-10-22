@@ -70,6 +70,7 @@ export function loadConfig(env = process.env) {
     hostSocket: env.ASTRA_DSH_HOST_SOCKET || join(effectiveDshHome, 'astra-dsh', 'host-control.sock'),
     executionBackend,
     hostProbeTimeoutMs: numberEnv(env, 'ASTRA_DSH_HOST_PROBE_TIMEOUT_MS', 700, { min: 100, max: 30_000 }),
+    hostPermissionPreset: env.ASTRA_DSH_HOST_PERMISSION_PRESET || 'danger-full-access',
     credentialsSource: env.ASTRA_DSH_CREDENTIALS || join(homedir(), '.dsh', '.credentials.yaml'),
     model: env.ASTRA_DSH_MODEL || 'deepseek-flash',
     modelProvider: env.ASTRA_DSH_MODEL_PROVIDER || 'deepseek-official',

@@ -696,10 +696,12 @@ export class TaskRunner {
           model: task.model || this.config.model,
           provider: this.config.modelProvider,
           reasoningEffort: task.effort || this.config.effort,
+          permissionPreset: this.config.hostPermissionPreset,
           prompt,
         }, { timeoutMs: 60_000 })
         task.sessionId = created.sessionId
         task.hostSessionId = created.sessionId
+        task.hostPermission = created.permission ?? this.config.hostPermissionPreset
         task.modelSelection = created.selected ? 'host-selected' : 'host-unverified'
         task.actualModel = created.selected ? `${created.selected.provider ?? this.config.modelProvider}/${created.selected.model ?? (task.model || this.config.model)}` : null
         task.requestedModel = `${this.config.modelProvider}/${task.model || this.config.model}`
@@ -2157,6 +2159,7 @@ export class TaskRunner {
       executionBackend: task.executionBackend ?? 'acp',
       live: task.live === true,
       hostSessionId: task.hostSessionId ?? null,
+      hostPermission: task.hostPermission ?? null,
       hostVersion: task.hostVersion ?? null,
       hostPid: task.hostPid ?? null,
       model: task.model || this.config.model,
@@ -2230,6 +2233,7 @@ export class TaskRunner {
       executionBackend: task.executionBackend ?? 'acp',
       live: task.live === true,
       hostVersion: task.hostVersion ?? null,
+      hostPermission: task.hostPermission ?? null,
       guiPolicy: task.guiPolicy ?? DEFAULT_GUI_POLICY,
       guiStatus: gui.status,
       guiStatusDetail: gui.detail ?? null,

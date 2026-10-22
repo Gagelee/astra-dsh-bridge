@@ -31,7 +31,7 @@ GUI 插件已从本地目录安装到 desktop profile：
 - `@astra-dsh/workspace-attach`（`gui-plugin/`）：外部 ACP session 的发布/归组
 - `@astra-dsh/host-control`（`host-plugin/`）：GUI 内 host-owned session 的控制面（Unix socket）
 
-如果重装 profile，需要在 Harness 的 Plugin Manager 里重新安装这两个本地 bundle（见各自的 README）。host session 沿用 GUI 的 DSH 权限 preset；`approval/policy=ask` 时文件写入可能需要在 DSH GUI 里批准，这并不是 bridge 的自动授权。
+如果重装 profile，需要在 Harness 的 Plugin Manager 里重新安装这两个本地 bundle（见各自的 README）。host session 默认使用 GUI 的 `danger-full-access` preset（sandbox full + `approval=never`），不再弹审批；这比 ACP 的 `workspace-write + allow` 更宽。若希望保留 workspace 限制，把 `ASTRA_DSH_HOST_PERMISSION_PRESET` 设为 `workspace-write`，但该预设仍是 `approval=ask`，文件写入可能需要在 GUI 批准。
 
 安装后重启 Codex，在项目里说：
 
@@ -324,6 +324,7 @@ Codex 发起的任务会出现在 DSH GUI 的会话列表里：
 | `ASTRA_DSH_NOTIFY_CODEX` | `1` | 任务 settle 时是否用 `codex queue` 触发同一 thread；`0` 关闭 |
 | `ASTRA_DSH_EXECUTION_BACKEND` | `auto` | `auto` / `host` / `acp`；host control 可用时走 GUI host，否则 ACP |
 | `ASTRA_DSH_HOST_SOCKET` | `~/.dsh/astra-dsh/host-control.sock` | host control Unix socket |
+| `ASTRA_DSH_HOST_PERMISSION_PRESET` | `danger-full-access` | host session 的 GUI permission preset；`danger-full-access` = 全权限 + `approval=never`，`workspace-write` = 需要 GUI 批准 |
 | `ASTRA_DSH_CODEX_BIN` | 自动探测 Codex app CLI | `codex queue` 使用的 CLI 路径 |
 | `ASTRA_DSH_LOCK_TTL_MS` | 2h | DSH 回合锁租期 |
 | `ASTRA_DSH_VERIFY_TIMEOUT_MS` | `120000` | 每条 `verifyCommands` 的超时 |

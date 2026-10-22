@@ -18,7 +18,7 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 export const name = 'astra-dsh-host-control'
-export const inject = ['sessionController', 'workspaceRegistry']
+export const inject = ['sessionController', 'workspaceRegistry', 'permissionPresets', 'sessions']
 export const VERSION = '0.1.0'
 export const PROTOCOL = 1
 
@@ -93,6 +93,19 @@ export function apply(ctx, options = {}) {
       // Grouping is best effort; the host-owned Session is still live without it.
       console.warn(`[astra-dsh-host-control] workspace attach failed: ${error?.message ?? error}`)
     }
+    let permission = null
+    if (typeof params?.permissionPreset === 'string' && params.permissionPreset) {
+      const session = ctx.sessions.get(sessionId)
+      if (!session) throw Object.assign(new Error('host session is not live; cannot set permission preset'), { code: 'HOST_SESSION_NOT_LIVE' })
+      if (!ctx.permissionPresets.names.includes(params.permissionPreset)) {
+        throw Object.assign(new Error(`unknown host permission preset ${params.permissionPreset}`), { code: 'HOST_PERMISSION_UNKNOWN' })
+      }
+      ctx.permissionPresets.set(session, params.permissionPreset)
+      permission = ctx.permissionPresets.current(session)
+      if (permission !== params.permissionPreset) {
+        throw Object.assign(new Error(`host permission preset is ${permission}, expected ${params.permissionPreset}`), { code: 'HOST_PERMISSION_MISMATCH' })
+      }
+    }
     let selected = null
     if (typeof params?.model === 'string' && params.model) {
       const provider = typeof params?.provider === 'string' && params.provider ? params.provider : 'deepseek-official'
@@ -115,7 +128,7 @@ export function apply(ctx, options = {}) {
         clientTimeZone: typeof params?.clientTimeZone === 'string' ? params.clientTimeZone : undefined,
       }, new AbortController().signal)
     }
-    return { sessionId, agentPreset: created.agentPreset ?? null, selected, attached, protocol: PROTOCOL }
+    return { sessionId, agentPreset: created.agentPreset ?? null, selected, permission, attached, protocol: PROTOCOL }
   }
 
   async function prompt(params) {

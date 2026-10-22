@@ -22,8 +22,9 @@
 ## 尚未完成 / 边界
 
 - host 任务在 bridge 退出后的自动 reconcile 尚未实现；host session 可能仍在跑，任务会保持 running（与 ACP 的 owner-exited 路径不同）。这是下一步。
-- host 权限沿用 GUI 的 DSH preset（`approval/policy=ask` 时可能需要 GUI 批准）；bridge 不能替用户批准。
+- host 权限默认设为 GUI 的 `danger-full-access` preset（sandbox 全权限 + `approval/policy=never`），等价于“不再弹审批、允许自行升级”，比 ACP 的 `workspace-write + allow` 更宽。可用 `ASTRA_DSH_HOST_PERMISSION_PRESET` 改回 `workspace-write`（该预设仍是 ask，需要 GUI 批准）。
 - 真实客户端渲染/肉眼 live 仍需在 GUI 里确认；host API 层已证明 session 是 host-owned 且 follow 有事件。
+- 已用真实 file write smoke 验证 `danger-full-access`：`permission/preset=danger-full-access`、`sandbox/mode=danger-full-access`、`approval/policy=never`，`perm-ok.txt` 成功写入，无 GUI 审批。
 
 ## 接入约定
 

@@ -25,6 +25,12 @@ function makeCtx() {
       resolveByPath: async (path) => (path === '/tmp/project' ? { id: 'ws-1', path, title: 'project', sessionIds: [] } : undefined),
       create: async (path) => ({ id: 'ws-created', path, title: 'created', sessionIds: [] }),
     },
+    sessions: { get: () => ({}) },
+    permissionPresets: {
+      names: ['workspace-write', 'danger-full-access'],
+      set: (session, name) => { calls.push(['permissionPreset', name]) },
+      current: () => 'danger-full-access',
+    },
     effect: () => {},
   }
   return { ctx, calls }
@@ -109,6 +115,20 @@ describe('host control plugin', () => {
     assert.equal(response.result.sessionId, 'sess-1')
     assert.equal(response.result.selected.model, 'deepseek-flash')
     assert.equal(response.result.selected.provider, 'deepseek-official')
+  })
+
+  it('applies and verifies a full-access permission preset', async () => {
+    const { ctx, calls } = makeCtx()
+    dir = mkdtempSync(join(tmpdir(), 'astra-dsh-host-control-'))
+    process.env.DSH_HOME = dir
+    controller = apply(ctx, { socketPath: join(dir, 'host.sock'), statusFile: join(dir, 'host.json') })
+    if (!controller.server.listening) await once(controller.server, 'listening')
+    client = connectSocket(join(dir, 'host.sock'))
+    client.send({ id: 'c', method: 'create', params: { cwd: '/tmp/project', permissionPreset: 'danger-full-access', prompt: 'do it' } })
+    const response = await client.next()
+    assert.equal(response.ok, true, JSON.stringify(response))
+    assert.equal(response.result.permission, 'danger-full-access')
+    assert.ok(calls.some(([name, value]) => name === 'permissionPreset' && value === 'danger-full-access'))
   })
 
   it('prompts, cancels, reports status, and resolves workspaces', async () => {
