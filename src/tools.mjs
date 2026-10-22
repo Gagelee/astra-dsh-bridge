@@ -10,6 +10,7 @@ import { loadConfig } from './config.mjs'
 import { WorkspaceStore } from './store.mjs'
 import { TaskRunner } from './task-runner.mjs'
 import { GUI_POLICIES, DEFAULT_GUI_POLICY } from './attach.mjs'
+import { probeHostControl } from './host-client.mjs'
 import { BridgeError, nowIso, oneLine, resolveWorkspace, truncate } from './util.mjs'
 
 const WORKSPACE = {
@@ -726,11 +727,12 @@ function dshReadFile(bridge, input) {
   }
 }
 
-function astraStatus(bridge, input, meta) {
+async function astraStatus(bridge, input, meta) {
   const { store, runner } = bridge.forWorkspace(input.workspace)
   const tasks = runner.list()
   const requests = store.listRequests()
   const plugin = runner.guiPluginHealth()
+  const host = await probeHostControl(bridge.config.hostSocket, { timeoutMs: bridge.config.hostProbeTimeoutMs })
   const payload = {
     workspace: store.workspace,
     board: store.root,
@@ -749,6 +751,8 @@ function astraStatus(bridge, input, meta) {
       codexSessionId: meta?.sessionId ?? process.env.CODEX_SESSION_ID ?? null,
       notifyCodex: bridge.config.notifyCodex !== false,
       codexBin: bridge.config.codexBin,
+      executionBackend: bridge.config.executionBackend,
+      hostSocket: bridge.config.hostSocket,
       permissionMode: bridge.config.permissionMode,
       permissionPolicy: bridge.config.permissionPolicy,
       stallWarningMs: bridge.config.stallWarningMs,
@@ -756,6 +760,14 @@ function astraStatus(bridge, input, meta) {
       notificationRetryBaseMs: bridge.config.notifyRetryBaseMs,
       notificationRetryMaxMs: bridge.config.notifyRetryMaxMs,
       watchdog: bridge.config.watchdog,
+    },
+    host: {
+      available: host.available === true,
+      version: host.version ?? null,
+      protocol: host.protocol ?? null,
+      pid: host.pid ?? null,
+      error: host.error ?? null,
+      capabilities: host.capabilities ?? [],
     },
     gui: {
       queueDir: runner.attachQueueDir,

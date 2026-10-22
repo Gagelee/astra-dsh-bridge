@@ -49,6 +49,11 @@ function findCodex(env) {
 }
 
 export function loadConfig(env = process.env) {
+  const effectiveDshHome = env.ASTRA_DSH_DSH_HOME || join(homedir(), '.dsh')
+  const executionBackend = env.ASTRA_DSH_EXECUTION_BACKEND || 'auto'
+  if (!['auto', 'host', 'acp'].includes(executionBackend)) {
+    throw new BridgeError('ASTRA_DSH_EXECUTION_BACKEND must be auto, host, or acp', { code: 'BAD_CONFIG' })
+  }
   const notifyRetryBaseMs = numberEnv(env, 'ASTRA_DSH_NOTIFY_RETRY_BASE_MS', 2000, { min: 1, max: 60 * 60 * 1000 })
   const notifyRetryMaxMs = numberEnv(
     env,
@@ -62,6 +67,9 @@ export function loadConfig(env = process.env) {
     codexBin: findCodex(env),
     notifyCodex: env.ASTRA_DSH_NOTIFY_CODEX !== '0',
     dshHome: env.ASTRA_DSH_DSH_HOME || null,
+    hostSocket: env.ASTRA_DSH_HOST_SOCKET || join(effectiveDshHome, 'astra-dsh', 'host-control.sock'),
+    executionBackend,
+    hostProbeTimeoutMs: numberEnv(env, 'ASTRA_DSH_HOST_PROBE_TIMEOUT_MS', 700, { min: 100, max: 30_000 }),
     credentialsSource: env.ASTRA_DSH_CREDENTIALS || join(homedir(), '.dsh', '.credentials.yaml'),
     model: env.ASTRA_DSH_MODEL || 'deepseek-flash',
     modelProvider: env.ASTRA_DSH_MODEL_PROVIDER || 'deepseek-official',

@@ -1,0 +1,21 @@
+{
+  "name": "@astra-dsh/host-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local host-control socket for Astra-DSH: creates and drives GUI-owned DSH sessions and reports host capabilities.",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

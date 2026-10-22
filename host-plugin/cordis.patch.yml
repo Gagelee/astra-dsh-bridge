@@ -1,0 +1,6 @@
+# Local host control plane for Astra-DSH. It only opens a private Unix socket
+# and drives host-owned sessions; it does not patch DSH internals.
+- insert:
+    - id: astra-dsh-host-control
+      name: '@astra-dsh/host-control'
+      config: {}
